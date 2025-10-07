@@ -13,8 +13,7 @@ from pymongo.errors import OperationFailure
 # Use float('inf') to signify effectively unlimited crawling
 UNLIMITED = float('inf')
 
-# --- Hardcoded Configuration Defaults (Replacing .env usage) ---
-# These values reflect the original .env.example defaults
+# --- Hardcoded Configuration Defaults---
 DEFAULT_CONFIG = {
     "SEED_URLS": ["https://example.com", "https://en.wikipedia.org/wiki/Main_Page"],
     "MAX_PAGES": UNLIMITED,
@@ -518,6 +517,7 @@ if __name__ == "__main__":
             crawler.crawl()
         except Exception as e:
             print(f"Crawler failed to initialize or run: {e}")
+
 
 
 
