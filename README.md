@@ -1,6 +1,6 @@
 # GreySearch
 
-A proof-of-concept system demonstrating a full-stack search engine pipeline, from crawling and indexing to serving search results. It uses a Node.js API and a Python worker, relying heavily on MongoDB for persistence and communication.
+A simple full-stack search engine pipeline, from crawling and indexing to serving search results. It uses a Node.js API and a Python worker, relying heavily on MongoDB for persistence and communication.
 
 Disclaimer: This code is a functional prototype. It is simplified, contains monolithic components, and lacks robust production-level error handling, security, and scaling features.
 
