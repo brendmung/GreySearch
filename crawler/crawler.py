@@ -13,14 +13,15 @@ from pymongo.errors import OperationFailure
 # Use float('inf') to signify effectively unlimited crawling
 UNLIMITED = float('inf')
 
-# --- Hardcoded Configuration Defaults---
+# --- Hardcoded Configuration Defaults ---
 DEFAULT_CONFIG = {
     "SEED_URLS": ["https://en.wikipedia.org/wiki/"],
     "MAX_PAGES": UNLIMITED,
     "DEPTH_LIMIT": 2, #can set to unlimited
+    "MAX_PAGES_PER_DOMAIN": 500, # Limit pages indexed per domain
     "BATCH_SIZE": 50,
     "COOLDOWN_TIME": 10.0,
-    "ALLOWED_DOMAINS": None, # Comma-separated list of domains to save (e.g., "*.com,wikipedia.org")
+    "ALLOWED_DOMAINS": [], 
     "BLACKLISTED_DOMAINS": [],
     "ENABLE_BREADCRUMBS": True,
     "RESUME_CRAWL": False,
@@ -38,6 +39,7 @@ class UnrestrictedWebSpider:
                  start_urls: List[str],
                  max_pages: float = UNLIMITED,
                  depth_limit: float = UNLIMITED,
+                 max_pages_per_domain: float = UNLIMITED,
                  resume: bool = False,
                  crawl_batch_size: int = 50,
                  cooldown_seconds: float = 5.0,
@@ -52,13 +54,13 @@ class UnrestrictedWebSpider:
 
         self.max_pages = max_pages
         self.depth_limit = depth_limit
+        self.max_pages_per_domain = max_pages_per_domain
         self.resume = resume
         self.crawl_batch_size = crawl_batch_size
         self.cooldown_seconds = cooldown_seconds
         self.save_breadcrumbs = save_breadcrumbs
 
         # MongoDB configuration
-        # MONGO_URI must come from the environment or be passed explicitly
         self.mongo_uri = mongo_uri or os.getenv("MONGO_URI")
         self.db_name = db_name
         self.results_collection_name = results_collection
@@ -76,6 +78,8 @@ class UnrestrictedWebSpider:
         self._connect_db()
 
         # Domain filtering
+        # If allowed_domains is an empty list [], it evaluates to False, and self.allowed_domains becomes None,
+        # which correctly signals unrestricted crawling in _is_domain_allowed.
         self.allowed_domains = set(allowed_domains) if allowed_domains else None
         self.blacklisted_domains = set(blacklisted_domains) if blacklisted_domains else set()
 
@@ -85,6 +89,9 @@ class UnrestrictedWebSpider:
         self.results_buffer: List[Dict[str, Any]] = []
         self.indexed_count = 0
         self.skipped_count = 0
+        
+        # Track indexed pages per domain
+        self.domain_counts: Dict[str, int] = {}
 
         # Breadcrumb tracking: url -> parent_url
         self.breadcrumbs: Dict[str, str] = {}
@@ -183,7 +190,8 @@ class UnrestrictedWebSpider:
             "indexed_count": self.indexed_count,
             "skipped_count": self.skipped_count,
             "breadcrumbs": self.breadcrumbs if self.save_breadcrumbs else {},
-            "allowed_domains": list(self.allowed_domains) if self.allowed_domains else None,
+            "domain_counts": self.domain_counts,
+            "allowed_domains": list(self.allowed_domains) if self.allowed_domains else [], # Save as [] if None for consistency
             "blacklisted_domains": list(self.blacklisted_domains),
             "timestamp": time.time()
         }
@@ -218,10 +226,27 @@ class UnrestrictedWebSpider:
             self.indexed_count = self.results_collection.count_documents({})
             self.skipped_count = state.get("skipped_count", 0)
             self.breadcrumbs = state.get("breadcrumbs", {})
+            self.domain_counts = state.get("domain_counts", {})
+
+            # If domain counts are missing (e.g., resuming from an old state file), recalculate them
+            if not self.domain_counts and self.indexed_count > 0:
+                print("[DB LOAD] Recalculating domain counts from results collection...")
+                pipeline = [
+                    {"$group": {"_id": "$domain", "count": {"$sum": 1}}}
+                ]
+                counts = self.results_collection.aggregate(pipeline)
+                self.domain_counts = {item['_id']: item['count'] for item in counts}
+                print(f"[DB LOAD] Found counts for {len(self.domain_counts)} domains.")
+
 
             # Load domain filtering settings
-            if "allowed_domains" in state and state["allowed_domains"]:
-                self.allowed_domains = set(state["allowed_domains"])
+            # If loaded list is empty, set to None for unrestricted mode
+            loaded_allowed = state.get("allowed_domains")
+            if loaded_allowed:
+                 self.allowed_domains = set(loaded_allowed)
+            else:
+                 self.allowed_domains = None
+                 
             if "blacklisted_domains" in state:
                 self.blacklisted_domains = set(state["blacklisted_domains"])
 
@@ -267,7 +292,7 @@ class UnrestrictedWebSpider:
             else:
                 print(f"[DATA SYNC] Critical error saving incremental results to DB: {e}")
 
-    # --- Domain Filtering Methods (Unchanged) ---
+    # --- Domain Filtering Methods ---
     def _matches_domain_pattern(self, url: str, pattern: str) -> bool:
         domain = self._get_domain(url)
         if domain == pattern: return True
@@ -281,17 +306,25 @@ class UnrestrictedWebSpider:
 
     def _is_domain_allowed(self, url: str) -> bool:
         domain = self._get_domain(url)
+        
+        # Check blacklist first
         for blacklisted in self.blacklisted_domains:
             if self._matches_domain_pattern(url, blacklisted): return False
-        if self.allowed_domains is None: return True
+            
+        # Check allowed list
+        if self.allowed_domains is None: 
+            # If allowed_domains is None (default when [] is passed), crawling is unrestricted
+            return True
+            
         for allowed in self.allowed_domains:
             if self._matches_domain_pattern(url, allowed): return True
+            
         return False
 
     def _should_save_page(self, url: str) -> bool:
         return self._is_domain_allowed(url)
 
-    # --- Utility Methods (Unchanged) ---
+    # --- Utility Methods ---
 
     def _initialize_seeds(self, start_urls: List[str]):
         print("Initializing seeds...")
@@ -314,7 +347,12 @@ class UnrestrictedWebSpider:
     def _is_valid_link(self, url: str) -> bool:
         parsed = urlparse(url)
         if parsed.scheme not in ['http', 'https']: return False
+        
+        # 1. Filter out common file extensions
         if re.search(r'\.(pdf|jpg|jpeg|png|gif|zip|rar|exe|svg|css|js|xml|txt)$', parsed.path.lower()): return False
+        
+        # 2. REMOVED: Wikipedia Namespace Filtering. The spider is now general purpose.
+        
         return True
 
     def _fetch_page(self, url: str) -> Optional[str]:
@@ -345,6 +383,7 @@ class UnrestrictedWebSpider:
         title = soup.title.string.strip() if soup.title and soup.title.string else "No Title Found"
         favicon_url = self._find_favicon_url(soup, current_url)
 
+        # Remove common non-content elements
         for element in soup(['script', 'style', 'header', 'footer', 'nav', 'form', 'aside', 'iframe', 'noscript']):
             element.decompose()
 
@@ -393,6 +432,8 @@ class UnrestrictedWebSpider:
         """Main crawling loop (BFS) with filtering, synchronization and cooldown."""
 
         print(f"Starting UNRESTRICTED, PERSISTENT crawl using MongoDB.")
+        if self.max_pages_per_domain != UNLIMITED:
+            print(f"Domain limit set to {int(self.max_pages_per_domain)} pages per domain.")
 
         try:
             while self.to_visit and (self.indexed_count < self.max_pages or self.max_pages == UNLIMITED):
@@ -417,22 +458,32 @@ class UnrestrictedWebSpider:
                     extracted_data = self._extract_data(html_content, current_url)
 
                     if self._should_save_page(current_url):
-                        document = {
-                            "url": current_url,
-                            "domain": self._get_domain(current_url),
-                            "title": extracted_data["title"],
-                            "content_snippet": extracted_data["content_snippet"],
-                            "favicon_url": extracted_data["favicon_url"],
-                            "crawled_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                            "depth": current_depth
-                        }
+                        domain = self._get_domain(current_url)
+                        
+                        # Domain Limit Check before indexing
+                        current_domain_count = self.domain_counts.get(domain, 0)
+                        if self.max_pages_per_domain != UNLIMITED and current_domain_count >= self.max_pages_per_domain:
+                            print(f"   -> Domain limit reached for {domain} ({current_domain_count}/{int(self.max_pages_per_domain)}). Skipping indexing.")
+                            self.skipped_count += 1
+                        else:
+                            # Index the page and update counts
+                            document = {
+                                "url": current_url,
+                                "domain": domain,
+                                "title": extracted_data["title"],
+                                "content_snippet": extracted_data["content_snippet"],
+                                "favicon_url": extracted_data["favicon_url"],
+                                "crawled_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "depth": current_depth
+                            }
 
-                        if self.save_breadcrumbs:
-                            document["breadcrumb_path"] = self._get_breadcrumb_path(current_url)
-                            document["parent_url"] = self.breadcrumbs.get(current_url)
+                            if self.save_breadcrumbs:
+                                document["breadcrumb_path"] = self._get_breadcrumb_path(current_url)
+                                document["parent_url"] = self.breadcrumbs.get(current_url)
 
-                        self.results_buffer.append(document)
-                        self.indexed_count += 1
+                            self.results_buffer.append(document)
+                            self.indexed_count += 1
+                            self.domain_counts[domain] = current_domain_count + 1 # Increment domain count
                     else:
                         self.skipped_count += 1
 
@@ -441,6 +492,14 @@ class UnrestrictedWebSpider:
                     # Queue discovered links
                     next_depth = current_depth + 1
                     for link in extracted_data["links_found"]:
+                        link_domain = self._get_domain(link)
+
+                        # Pre-check domain limit before queuing
+                        if self.max_pages_per_domain != UNLIMITED:
+                            if self.domain_counts.get(link_domain, 0) >= self.max_pages_per_domain:
+                                # Don't queue links for domains that have already hit their quota
+                                continue
+
                         if link not in self.visited:
                             self.visited.add(link)
                             self.to_visit.append((link, next_depth))
@@ -485,6 +544,7 @@ if __name__ == "__main__":
     SEED_URLS = DEFAULT_CONFIG["SEED_URLS"]
     MAX_PAGES = DEFAULT_CONFIG["MAX_PAGES"]
     DEPTH_LIMIT = DEFAULT_CONFIG["DEPTH_LIMIT"]
+    MAX_PAGES_PER_DOMAIN = DEFAULT_CONFIG["MAX_PAGES_PER_DOMAIN"]
     BATCH_SIZE = DEFAULT_CONFIG["BATCH_SIZE"]
     COOLDOWN_TIME = DEFAULT_CONFIG["COOLDOWN_TIME"]
     ALLOWED_DOMAINS = DEFAULT_CONFIG["ALLOWED_DOMAINS"]
@@ -505,10 +565,11 @@ if __name__ == "__main__":
                 start_urls=SEED_URLS,
                 max_pages=MAX_PAGES,
                 depth_limit=DEPTH_LIMIT,
+                max_pages_per_domain=MAX_PAGES_PER_DOMAIN,
                 resume=RESUME_CRAWL,
                 crawl_batch_size=BATCH_SIZE,
                 cooldown_seconds=COOLDOWN_TIME,
-                allowed_domains=ALLOWED_DOMAINS,
+                allowed_domains=ALLOWED_DOMAINS, # This is now [] (unrestricted)
                 blacklisted_domains=BLACKLISTED_DOMAINS,
                 save_breadcrumbs=ENABLE_BREADCRUMBS,
                 mongo_uri=MONGO_URI,
@@ -517,8 +578,3 @@ if __name__ == "__main__":
             crawler.crawl()
         except Exception as e:
             print(f"Crawler failed to initialize or run: {e}")
-
-
-
-
-
