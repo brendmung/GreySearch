@@ -15,7 +15,7 @@ UNLIMITED = float('inf')
 
 # --- Hardcoded Configuration Defaults---
 DEFAULT_CONFIG = {
-    "SEED_URLS": ["https://example.com", "https://en.wikipedia.org/wiki/Main_Page"],
+    "SEED_URLS": ["https://en.wikipedia.org/wiki/"],
     "MAX_PAGES": UNLIMITED,
     "DEPTH_LIMIT": 2, #can set to unlimited
     "BATCH_SIZE": 50,
@@ -517,6 +517,7 @@ if __name__ == "__main__":
             crawler.crawl()
         except Exception as e:
             print(f"Crawler failed to initialize or run: {e}")
+
 
 
 
