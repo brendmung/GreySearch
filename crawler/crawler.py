@@ -15,7 +15,7 @@ UNLIMITED = float('inf')
 
 # --- Hardcoded Configuration Defaults ---
 DEFAULT_CONFIG = {
-    "SEED_URLS": ["https://en.wikipedia.org/wiki/Main_Page"], # Changed seed to a specific page for testing
+    "SEED_URLS": ["https://en.wikipedia.org/wiki/"], # Changed seed to a specific page for testing
     "MAX_PAGES": UNLIMITED,
     "DEPTH_LIMIT": 2, 
     "MAX_PAGES_PER_DOMAIN": 300, 
@@ -27,7 +27,7 @@ DEFAULT_CONFIG = {
     "RESUME_CRAWL": False,
     "DB_NAME": "greysearch_db",
     "STRICT_DOMAIN_MODE": True,
-    "CRAWL_EXTERNAL_BUT_DONT_SAVE": True
+    "CRAWL_EXTERNAL_BUT_DONT_SAVE": False
 }
 # -----------------------------------------------------------------
 
@@ -683,3 +683,4 @@ if __name__ == "__main__":
             crawler.crawl()
         except Exception as e:
             print(f"Crawler failed to initialize or run: {e}")
+
