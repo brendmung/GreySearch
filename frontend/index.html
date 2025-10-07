@@ -371,7 +371,7 @@
     <div class="container">
         <div class="header" id="header">
             <div class="logo">GreySearch</div>
-            <div class="tagline">Search the Indexed Web (Powered by MongoDB)</div>
+            <div class="tagline">Search the Indexed Web</div>
         </div>
 
         <div class="search-container">
@@ -382,7 +382,6 @@
             </div>
         </div>
 
-        <!-- NEW CRAWL REQUEST SECTION -->
         <div class="crawl-request-container" id="crawlRequestContainer">
             <h4>Want to index a site? Submit a URL for crawling:</h4>
             <div class="crawl-request-form">
@@ -391,7 +390,6 @@
             </div>
             <div id="requestMessage" style="color: #6b9bd1;"></div>
         </div>
-        <!-- END NEW SECTION -->
 
         <div class="stats" id="stats"></div>
         <div class="results-container" id="results"></div>
@@ -404,7 +402,7 @@
 
     <script>
         // Configuration: Ensure this matches your Node.js API server location
-        // IMPORTANT: When deploying, replace 'https://greysearch-api.vercel.app/api' with your deployed API URL.
+        // IMPORTANT: When deploying, replace 'https://greysearch-api.onrender.com/api' with your deployed API URL.
         const API_BASE_URL = 'https://greysearch-api.onrender.com/api';
         const RESULTS_PER_PAGE = 10;
 
@@ -487,7 +485,7 @@
 
 
         /**
-         * Performs the search by calling the Node.js API. (Existing function)
+         * Performs the search by calling the Node.js API.
          */
         async function performSearch(page = 1) {
             const query = document.getElementById('searchInput').value.trim();
@@ -613,7 +611,7 @@
                 </button>
             `;
 
-            // Page numbers with ellipsis logic (unchanged)
+            // Page numbers with ellipsis logic
             const maxVisiblePages = 7;
             let startPage = Math.max(1, currentPage - Math.floor(maxVisiblePages / 2));
             let endPage = Math.min(totalPages, startPage + maxVisiblePages - 1);
@@ -662,7 +660,7 @@
             performSearch(page);
         }
 
-        // Highlight search query in text (Existing function)
+        // Highlight search query in text
         function highlightQuery(text, query) {
             if (!query) return text;
             // Use currentQuery for highlighting, as the API handles the search logic
@@ -674,7 +672,7 @@
             return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         }
 
-        // Search on Enter key (Existing function)
+        // Search on Enter key
         document.getElementById('searchInput').addEventListener('keypress', (e) => {
             if (e.key === 'Enter') {
                 performSearch();
@@ -691,3 +689,4 @@
     </script>
 </body>
 </html>
+
