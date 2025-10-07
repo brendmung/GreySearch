@@ -26,11 +26,11 @@ DEFAULT_CONFIG = {
     "ALLOWED_DOMAINS": [], 
     "BLACKLISTED_DOMAINS": [],
     "ENABLE_BREADCRUMBS": True,
-    "RESUME_CRAWL": False,
+    "RESUME_CRAWL": True,
     "DB_NAME": "greysearch_db",
     "STRICT_DOMAIN_MODE": False,
     "CRAWL_EXTERNAL_BUT_DONT_SAVE": True,
-    "ROBOTS_ENABLED": True
+    "ROBOTS_ENABLED": False #temporary, for testing
 }
 # -----------------------------------------------------------------
 
@@ -710,7 +710,7 @@ if __name__ == "__main__":
     ALLOWED_DOMAINS = DEFAULT_CONFIG["ALLOWED_DOMAINS"]
     BLACKLISTED_DOMAINS = DEFAULT_CONFIG["BLACKLISTED_DOMAINS"]
     ENABLE_BREADCRUMBS = DEFAULT_CONFIG["ENABLE_BREADCRUMBS"]
-    RESUME_CRAWL = DEFAULT_CONFIG["RESUME_CRAWL"]
+    RESUME_CRAWL = DEFAULT_CONFIG["RESUME_CRAWL"] # Now True
     MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", DEFAULT_CONFIG["DB_NAME"])
     
     # --- TOGGLES ---
