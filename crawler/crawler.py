@@ -7,7 +7,6 @@ import re
 import os
 from collections import deque
 from typing import List, Optional, Dict, Any, Set, Tuple
-# Removed: from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import OperationFailure
 
@@ -17,12 +16,12 @@ UNLIMITED = float('inf')
 # --- Hardcoded Configuration Defaults (Replacing .env usage) ---
 # These values reflect the original .env.example defaults
 DEFAULT_CONFIG = {
-    "SEED_URLS": ["https://example.com", "https://https://en.wikipedia.org/wiki/Main_Page"],
+    "SEED_URLS": ["https://example.com", "https://en.wikipedia.org/wiki/Main_Page"],
     "MAX_PAGES": UNLIMITED,
     "DEPTH_LIMIT": 2, #can set to unlimited
     "BATCH_SIZE": 50,
     "COOLDOWN_TIME": 10.0,
-    "ALLOWED_DOMAINS": None, # Comma-separated list of domains to save (e.g., "*.co.zw,wikipedia.org")
+    "ALLOWED_DOMAINS": None, # Comma-separated list of domains to save (e.g., "*.com,wikipedia.org")
     "BLACKLISTED_DOMAINS": [],
     "ENABLE_BREADCRUMBS": True,
     "RESUME_CRAWL": False,
@@ -519,5 +518,6 @@ if __name__ == "__main__":
             crawler.crawl()
         except Exception as e:
             print(f"Crawler failed to initialize or run: {e}")
+
 
 
