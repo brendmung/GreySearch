@@ -18,7 +18,7 @@ DEFAULT_CONFIG = {
     "SEED_URLS": ["https://en.wikipedia.org/wiki/"],
     "MAX_PAGES": UNLIMITED,
     "DEPTH_LIMIT": 2, #can set to unlimited
-    "MAX_PAGES_PER_DOMAIN": 500, # Limit pages indexed per domain
+    "MAX_PAGES_PER_DOMAIN": 300, # Limit pages indexed per domain
     "BATCH_SIZE": 50,
     "COOLDOWN_TIME": 10.0,
     "ALLOWED_DOMAINS": [], 
@@ -608,3 +608,4 @@ if __name__ == "__main__":
             crawler.crawl()
         except Exception as e:
             print(f"Crawler failed to initialize or run: {e}")
+
