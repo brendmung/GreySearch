@@ -15,17 +15,19 @@ UNLIMITED = float('inf')
 
 # --- Hardcoded Configuration Defaults ---
 DEFAULT_CONFIG = {
-    "SEED_URLS": ["https://en.wikipedia.org/wiki/"],
+    "SEED_URLS": ["https://en.wikipedia.org/wiki/Main_Page"], # Changed seed to a specific page for testing
     "MAX_PAGES": UNLIMITED,
-    "DEPTH_LIMIT": 2, #can set to unlimited
-    "MAX_PAGES_PER_DOMAIN": 300, # Limit pages indexed per domain
+    "DEPTH_LIMIT": 2, 
+    "MAX_PAGES_PER_DOMAIN": 300, 
     "BATCH_SIZE": 50,
     "COOLDOWN_TIME": 10.0,
     "ALLOWED_DOMAINS": [], 
     "BLACKLISTED_DOMAINS": [],
     "ENABLE_BREADCRUMBS": True,
     "RESUME_CRAWL": False,
-    "DB_NAME": "greysearch_db"
+    "DB_NAME": "greysearch_db",
+    "STRICT_DOMAIN_MODE": True,
+    "CRAWL_EXTERNAL_BUT_DONT_SAVE": True
 }
 # -----------------------------------------------------------------
 
@@ -33,7 +35,7 @@ DEFAULT_CONFIG = {
 class UnrestrictedWebSpider:
     """
     An UNRESTRICTED, persistent web spider using MongoDB for persistence.
-    Fixes the 'document too large' error by distributing URL state across a dedicated collection.
+    Includes strict domain enforcement and crawl-but-don't-save external modes.
     """
 
     def __init__(self,
@@ -52,7 +54,10 @@ class UnrestrictedWebSpider:
                  results_collection: str = "pages",
                  state_collection: str = "crawler_state",
                  requests_collection: str = "crawl_requests",
-                 queue_collection: str = "crawler_queue"): # New collection for URL state
+                 queue_collection: str = "crawler_queue",
+                 # --- NEW PARAMETERS ---
+                 strict_domain_mode: bool = False,
+                 crawl_external_but_dont_save: bool = False):
 
         self.max_pages = max_pages
         self.depth_limit = depth_limit
@@ -61,6 +66,10 @@ class UnrestrictedWebSpider:
         self.crawl_batch_size = crawl_batch_size
         self.cooldown_seconds = cooldown_seconds
         self.save_breadcrumbs = save_breadcrumbs
+        
+        # --- NEW TOGGLE ASSIGNMENTS ---
+        self.strict_domain_mode = strict_domain_mode
+        self.crawl_external_but_dont_save = crawl_external_but_dont_save
 
         # MongoDB configuration
         self.mongo_uri = mongo_uri or os.getenv("MONGO_URI")
@@ -68,7 +77,7 @@ class UnrestrictedWebSpider:
         self.results_collection_name = results_collection
         self.state_collection_name = state_collection
         self.requests_collection_name = requests_collection
-        self.queue_collection_name = queue_collection # New
+        self.queue_collection_name = queue_collection 
 
         if not self.mongo_uri:
             raise ValueError("MongoDB URI must be provided via argument or MONGO_URI environment variable.")
@@ -78,12 +87,25 @@ class UnrestrictedWebSpider:
         self.results_collection = None
         self.state_collection = None
         self.requests_collection = None
-        self.queue_collection = None # New
+        self.queue_collection = None 
         self._connect_db()
 
-        # Domain filtering
-        self.allowed_domains = set(allowed_domains) if allowed_domains else None
+        # Domain filtering setup
         self.blacklisted_domains = set(blacklisted_domains) if blacklisted_domains else set()
+        
+        if self.strict_domain_mode and not allowed_domains:
+            # If strict mode is on and no explicit allowed list is given, 
+            # derive allowed list from initial seeds.
+            derived_domains = {self._get_domain(url) for url in start_urls}
+            self.allowed_domains = derived_domains
+            print(f"[CONFIG] Strict Domain Mode enabled. Allowed domains derived from seeds: {self.allowed_domains}")
+        elif allowed_domains:
+            self.allowed_domains = set(allowed_domains)
+        else:
+            self.allowed_domains = None # Allow all domains (subject to blacklisting)
+            
+        if self.crawl_external_but_dont_save and self.strict_domain_mode:
+            print("[WARNING] Both strict_domain_mode and crawl_external_but_dont_save are True. Strict mode takes precedence for link queuing.")
 
         # Queue stores tuples of (url, depth, parent_url_if_known)
         self.to_visit: deque[Tuple[str, int, Optional[str]]] = deque()
@@ -122,7 +144,7 @@ class UnrestrictedWebSpider:
             self.results_collection = self.db[self.results_collection_name]
             self.state_collection = self.db[self.state_collection_name]
             self.requests_collection = self.db[self.requests_collection_name]
-            self.queue_collection = self.db[self.queue_collection_name] # New Queue Collection
+            self.queue_collection = self.db[self.queue_collection_name] 
 
             # Ensure indexes for efficient searching and uniqueness
             self.results_collection.create_index([("url", ASCENDING)], unique=True)
@@ -177,7 +199,7 @@ class UnrestrictedWebSpider:
         count = 0
 
         if not requests_to_process:
-            print("[REQUESTS] No pending user crawl requests found.")
+            # print("[REQUESTS] No pending user crawl requests found.")
             return
 
         print(f"[REQUESTS] Processing {len(requests_to_process)} user crawl requests.")
@@ -217,6 +239,8 @@ class UnrestrictedWebSpider:
             "domain_counts": self.domain_counts,
             "allowed_domains": list(self.allowed_domains) if self.allowed_domains else [],
             "blacklisted_domains": list(self.blacklisted_domains),
+            "strict_domain_mode": self.strict_domain_mode,
+            "crawl_external_but_dont_save": self.crawl_external_but_dont_save,
             "timestamp": time.time()
         }
 
@@ -228,7 +252,6 @@ class UnrestrictedWebSpider:
             )
             print("[STATE SAVE] Metadata saved successfully.")
         except Exception as e:
-            # This error should now be highly unlikely unless domain_counts is huge
             print(f"[STATE SAVE] Error saving metadata state to DB: {e}")
 
     def _load_state_db(self) -> bool:
@@ -244,14 +267,18 @@ class UnrestrictedWebSpider:
             self.indexed_count = state.get("indexed_count", 0)
             self.skipped_count = state.get("skipped_count", 0)
             self.domain_counts = state.get("domain_counts", {})
+            self.strict_domain_mode = state.get("strict_domain_mode", False)
+            self.crawl_external_but_dont_save = state.get("crawl_external_but_dont_save", False)
+
 
             # Load domain filtering settings
             loaded_allowed = state.get("allowed_domains")
             self.allowed_domains = set(loaded_allowed) if loaded_allowed else None
             self.blacklisted_domains = set(state.get("blacklisted_domains", []))
 
-            # Rebuild in-memory queue from the queue collection
+            # Rebuild in-memory queue from the persistent queue collection
             print("[DB LOAD] Rebuilding in-memory queue from persistent storage...")
+            # We only load 'pending' items back into the in-memory queue
             pending_urls = self.queue_collection.find({"status": "pending"}).sort([("depth", ASCENDING)])
             
             queue_count = 0
@@ -315,23 +342,50 @@ class UnrestrictedWebSpider:
         return False
 
     def _is_domain_allowed(self, url: str) -> bool:
+        """
+        Checks if the URL's domain is allowed based on the configuration 
+        (i.e., not blacklisted AND either unrestricted or on the allowed list).
+        This determines if a page is *saved*.
+        """
         domain = self._get_domain(url)
         
-        # Check blacklist first
+        # Check blacklist first (always enforced)
         for blacklisted in self.blacklisted_domains:
             if self._matches_domain_pattern(url, blacklisted): return False
             
         # Check allowed list
         if self.allowed_domains is None: 
-            return True
+            return True # Unrestricted mode
             
         for allowed in self.allowed_domains:
             if self._matches_domain_pattern(url, allowed): return True
             
-        return False
+        return False # Domain did not match any allowed pattern
 
-    def _should_save_page(self, url: str) -> bool:
+    def _should_queue_link(self, url: str) -> bool:
+        """
+        Determines if a newly discovered link should be added to the queue for crawling.
+        This respects both strict mode and blacklisting.
+        """
+        # 1. Check blacklisting (always enforced)
+        domain = self._get_domain(url)
+        for blacklisted in self.blacklisted_domains:
+            if self._matches_domain_pattern(url, blacklisted): return False
+
+        # 2. Check Strict Mode (Toggle 1)
+        if self.strict_domain_mode:
+            # If strict, we only queue if it's in the allowed list (derived from seeds)
+            return self._is_domain_allowed(url)
+
+        # 3. Check Crawl External Mode (Toggle 2)
+        if self.crawl_external_but_dont_save:
+            # If T2 is True, we queue everything (since blacklisting was checked above)
+            return True
+            
+        # 4. Standard Mode (T1=False, T2=False)
+        # We only queue if it passes the standard allowance rules (either explicitly allowed or unrestricted)
         return self._is_domain_allowed(url)
+
 
     # --- Utility Methods ---
 
@@ -465,18 +519,20 @@ class UnrestrictedWebSpider:
                     self.skipped_count += 1
                     continue
 
-                # Check if URL was already indexed/skipped (should be handled by _load_state_db, but good safety check)
+                # Check if URL was already indexed/skipped/processed
                 queue_status = self.queue_collection.find_one({"_id": current_url}, projection={"status": 1})
                 if queue_status and queue_status.get('status') != 'pending':
                     continue
 
+                # Fetch the page (We fetch it if it's in the queue, regardless of domain, unless strict mode prevented queuing)
                 html_content = self._fetch_page(current_url, current_depth)
 
                 if html_content:
                     extracted_data = self._extract_data(html_content, current_url)
                     domain = self._get_domain(current_url)
                     
-                    if self._should_save_page(current_url):
+                    # 1. Decide if we save the content (Saving is governed by _is_domain_allowed)
+                    if self._is_domain_allowed(current_url):
                         
                         # Domain Limit Check before indexing
                         current_domain_count = self.domain_counts.get(domain, 0)
@@ -498,7 +554,6 @@ class UnrestrictedWebSpider:
                             }
 
                             if self.save_breadcrumbs:
-                                # Breadcrumb path is dynamically generated using parent links stored in the queue collection
                                 document["breadcrumb_path"] = self._get_breadcrumb_path(current_url)
                                 document["parent_url"] = parent_url
 
@@ -510,16 +565,22 @@ class UnrestrictedWebSpider:
                             self.queue_collection.update_one({"_id": current_url}, {"$set": {"status": "indexed"}})
 
                     else:
+                        # Page was crawled (because it was queued), but not saved (Toggle 2 behavior)
                         self.skipped_count += 1
-                        # Update status in DB to 'skipped'
-                        self.queue_collection.update_one({"_id": current_url}, {"$set": {"status": "skipped"}})
+                        # Update status in DB to 'processed_not_saved'
+                        self.queue_collection.update_one({"_id": current_url}, {"$set": {"status": "processed_not_saved"}})
+                        print(f"   -> Skipped saving content (External/Disallowed Domain): {current_url}")
 
 
                     self.batch_counter += 1
 
-                    # Queue discovered links
+                    # 2. Queue discovered links
                     next_depth = current_depth + 1
                     for link in extracted_data["links_found"]:
+                        
+                        if not self._should_queue_link(link):
+                            continue
+
                         link_domain = self._get_domain(link)
 
                         # Pre-check domain limit before queuing
@@ -527,7 +588,7 @@ class UnrestrictedWebSpider:
                             if self.domain_counts.get(link_domain, 0) >= self.max_pages_per_domain:
                                 continue
 
-                        # Use the centralized queuing function
+                        # Queue the link
                         self._add_to_queue_db(link, next_depth, parent_url=current_url)
 
                     # Synchronization and Rate Limiting Check
@@ -560,7 +621,7 @@ class UnrestrictedWebSpider:
                 self.client.close()
             print(f"\nCrawling process halted.")
             print(f"Total indexed pages: {self.indexed_count}")
-            print(f"Total skipped pages: {self.skipped_count}")
+            print(f"Total skipped pages (failed fetch or not saved): {self.skipped_count}")
 
 
 # --- Execution Block ---
@@ -582,6 +643,10 @@ if __name__ == "__main__":
     ENABLE_BREADCRUMBS = DEFAULT_CONFIG["ENABLE_BREADCRUMBS"]
     RESUME_CRAWL = DEFAULT_CONFIG["RESUME_CRAWL"]
     MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", DEFAULT_CONFIG["DB_NAME"])
+    
+    # --- NEW TOGGLES ---
+    STRICT_DOMAIN_MODE = DEFAULT_CONFIG["STRICT_DOMAIN_MODE"]
+    CRAWL_EXTERNAL_BUT_DONT_SAVE = DEFAULT_CONFIG["CRAWL_EXTERNAL_BUT_DONT_SAVE"]
 
 
     if not SEED_URLS and not RESUME_CRAWL:
@@ -591,6 +656,14 @@ if __name__ == "__main__":
         print("Error: MONGO_URI environment variable is required to run the crawler.")
     else:
         try:
+            # Example configuration for strict mode:
+            # STRICT_DOMAIN_MODE = True 
+            # CRAWL_EXTERNAL_BUT_DONT_SAVE = False
+            
+            # Example configuration for crawl external but don't save:
+            # STRICT_DOMAIN_MODE = False
+            # CRAWL_EXTERNAL_BUT_DONT_SAVE = True
+            
             crawler = UnrestrictedWebSpider(
                 start_urls=SEED_URLS,
                 max_pages=MAX_PAGES,
@@ -603,9 +676,10 @@ if __name__ == "__main__":
                 blacklisted_domains=BLACKLISTED_DOMAINS,
                 save_breadcrumbs=ENABLE_BREADCRUMBS,
                 mongo_uri=MONGO_URI,
-                db_name=MONGO_DB_NAME
+                db_name=MONGO_DB_NAME,
+                strict_domain_mode=STRICT_DOMAIN_MODE,
+                crawl_external_but_dont_save=CRAWL_EXTERNAL_BUT_DONT_SAVE
             )
             crawler.crawl()
         except Exception as e:
             print(f"Crawler failed to initialize or run: {e}")
-
