@@ -26,8 +26,8 @@ DEFAULT_CONFIG = {
     "ENABLE_BREADCRUMBS": True,
     "RESUME_CRAWL": False,
     "DB_NAME": "greysearch_db",
-    "STRICT_DOMAIN_MODE": True,
-    "CRAWL_EXTERNAL_BUT_DONT_SAVE": False
+    "STRICT_DOMAIN_MODE": False,
+    "CRAWL_EXTERNAL_BUT_DONT_SAVE": True
 }
 # -----------------------------------------------------------------
 
@@ -683,5 +683,6 @@ if __name__ == "__main__":
             crawler.crawl()
         except Exception as e:
             print(f"Crawler failed to initialize or run: {e}")
+
 
 
