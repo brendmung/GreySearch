@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GreySearch - Web Search Engine</title>
     <style>
-        /* --- CSS STYLES (Retained from original for responsiveness and design) --- */
+        /* --- CSS STYLES  --- */
         * {
             margin: 0;
             padding: 0;
@@ -126,6 +126,11 @@
             background: #222;
             border: 1px solid #333;
             border-radius: 12px;
+            transition: all 0.3s ease;
+        }
+
+        .crawl-request-container.hidden {
+            display: none;
         }
 
         .crawl-request-container h4 {
@@ -247,6 +252,11 @@
             color: #b0b0b0;
             font-size: 14px;
             line-height: 1.6;
+            display: -webkit-box;
+            -webkit-line-clamp: 3;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         .result-meta {
@@ -373,7 +383,7 @@
         </div>
 
         <!-- NEW CRAWL REQUEST SECTION -->
-        <div class="crawl-request-container">
+        <div class="crawl-request-container" id="crawlRequestContainer">
             <h4>Want to index a site? Submit a URL for crawling:</h4>
             <div class="crawl-request-form">
                 <input type="url" id="requestUrlInput" placeholder="https://example.com" required>
@@ -485,22 +495,25 @@
             const statsDiv = document.getElementById('stats');
             const paginationDiv = document.getElementById('pagination');
             const header = document.getElementById('header');
+            const crawlRequestContainer = document.getElementById('crawlRequestContainer');
 
             if (!query) {
                 resultsDiv.innerHTML = '';
                 statsDiv.innerHTML = '';
                 paginationDiv.innerHTML = '';
+                crawlRequestContainer.classList.remove('hidden');
                 return;
             }
 
             currentQuery = query;
             currentPage = page;
 
-            // Compact header after first search
+            // Compact header after first search and hide crawl request section
             if (!hasSearched) {
                 header.classList.add('compact');
                 hasSearched = true;
             }
+            crawlRequestContainer.classList.add('hidden');
 
             // Show loading state
             resultsDiv.innerHTML = `
@@ -538,6 +551,7 @@
                             <p>Try different keywords or check your spelling</p>
                         </div>
                     `;
+                    crawlRequestContainer.classList.remove('hidden');
                     return;
                 }
 
@@ -577,6 +591,7 @@
                 `;
                 statsDiv.innerHTML = '';
                 paginationDiv.innerHTML = '';
+                crawlRequestContainer.classList.remove('hidden');
             }
         }
 
@@ -676,4 +691,3 @@
     </script>
 </body>
 </html>
-
