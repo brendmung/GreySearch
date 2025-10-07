@@ -9,13 +9,15 @@ from collections import deque
 from typing import List, Optional, Dict, Any, Set, Tuple
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import OperationFailure, DuplicateKeyError
+import urllib.robotparser # Import for robots.txt handling
+from urllib.robotparser import RobotFileParser # Specific class import
 
 # Use float('inf') to signify effectively unlimited crawling
 UNLIMITED = float('inf')
 
 # --- Hardcoded Configuration Defaults ---
 DEFAULT_CONFIG = {
-    "SEED_URLS": ["https://en.wikipedia.org/wiki/Main_Page"], # Changed seed to a specific page for testing
+    "SEED_URLS": ["https://en.wikipedia.org/wiki/Main_Page", "https://github.com"],
     "MAX_PAGES": UNLIMITED,
     "DEPTH_LIMIT": 2, 
     "MAX_PAGES_PER_DOMAIN": 300, 
@@ -27,7 +29,8 @@ DEFAULT_CONFIG = {
     "RESUME_CRAWL": False,
     "DB_NAME": "greysearch_db",
     "STRICT_DOMAIN_MODE": False,
-    "CRAWL_EXTERNAL_BUT_DONT_SAVE": True
+    "CRAWL_EXTERNAL_BUT_DONT_SAVE": True,
+    "ROBOTS_ENABLED": True
 }
 # -----------------------------------------------------------------
 
@@ -35,7 +38,7 @@ DEFAULT_CONFIG = {
 class UnrestrictedWebSpider:
     """
     An UNRESTRICTED, persistent web spider using MongoDB for persistence.
-    Includes strict domain enforcement and crawl-but-don't-save external modes.
+    Now includes respect for robots.txt.
     """
 
     def __init__(self,
@@ -55,9 +58,9 @@ class UnrestrictedWebSpider:
                  state_collection: str = "crawler_state",
                  requests_collection: str = "crawl_requests",
                  queue_collection: str = "crawler_queue",
-                 # --- NEW PARAMETERS ---
                  strict_domain_mode: bool = False,
-                 crawl_external_but_dont_save: bool = False):
+                 crawl_external_but_dont_save: bool = False,
+                 robots_enabled: bool = True): # Added robots_enabled parameter
 
         self.max_pages = max_pages
         self.depth_limit = depth_limit
@@ -70,6 +73,7 @@ class UnrestrictedWebSpider:
         # --- NEW TOGGLE ASSIGNMENTS ---
         self.strict_domain_mode = strict_domain_mode
         self.crawl_external_but_dont_save = crawl_external_but_dont_save
+        self.robots_enabled = robots_enabled # Assign robots flag
 
         # MongoDB configuration
         self.mongo_uri = mongo_uri or os.getenv("MONGO_URI")
@@ -94,15 +98,13 @@ class UnrestrictedWebSpider:
         self.blacklisted_domains = set(blacklisted_domains) if blacklisted_domains else set()
         
         if self.strict_domain_mode and not allowed_domains:
-            # If strict mode is on and no explicit allowed list is given, 
-            # derive allowed list from initial seeds.
             derived_domains = {self._get_domain(url) for url in start_urls}
             self.allowed_domains = derived_domains
             print(f"[CONFIG] Strict Domain Mode enabled. Allowed domains derived from seeds: {self.allowed_domains}")
         elif allowed_domains:
             self.allowed_domains = set(allowed_domains)
         else:
-            self.allowed_domains = None # Allow all domains (subject to blacklisting)
+            self.allowed_domains = None
             
         if self.crawl_external_but_dont_save and self.strict_domain_mode:
             print("[WARNING] Both strict_domain_mode and crawl_external_but_dont_save are True. Strict mode takes precedence for link queuing.")
@@ -115,6 +117,9 @@ class UnrestrictedWebSpider:
         
         # Track indexed pages per domain
         self.domain_counts: Dict[str, int] = {}
+        
+        # Robot exclusion protocol cache
+        self.robots_parsers: Dict[str, RobotFileParser] = {} 
 
         # Initialize or Load State
         if self.resume and self._load_state_db():
@@ -128,10 +133,64 @@ class UnrestrictedWebSpider:
         self.headers = {
             'User-Agent': 'UnrestrictedWebSpiderBot/1.0 (Persistent Internet Mapping - Use with extreme caution)'
         }
+        self.user_agent = self.headers['User-Agent'] # Store User-Agent for robots check
 
         self.delay = 0.5
         self.batch_counter = 0
 
+    # --- Robots.txt Methods ---
+
+    def _get_robot_parser(self, domain: str) -> Optional[RobotFileParser]:
+        """
+        Fetches, parses, and caches the robots.txt file for a given domain.
+        Tries HTTPS first, falls back to HTTP.
+        """
+        if domain in self.robots_parsers:
+            return self.robots_parsers[domain]
+        
+        parser = RobotFileParser()
+        
+        # Attempt 1: HTTPS
+        robots_url_https = f"https://{domain}/robots.txt"
+        parser.set_url(robots_url_https)
+        
+        try:
+            parser.read()
+            
+            # If mtime is 0, the attempt failed (e.g., 404, connection error). Try HTTP fallback.
+            if parser.mtime() == 0:
+                robots_url_http = f"http://{domain}/robots.txt"
+                parser.set_url(robots_url_http)
+                parser.read()
+
+        except Exception as e:
+            print(f"[ROBOTS] Severe error fetching robots.txt for {domain}: {e}")
+            # On severe error, the parser is cached but likely empty, defaulting to allow all.
+            
+        self.robots_parsers[domain] = parser
+        return parser
+
+    def _is_url_allowed_by_robots(self, url: str) -> bool:
+        """Checks if the given URL is allowed to be fetched by the configured User-Agent."""
+        if not self.robots_enabled:
+            return True
+            
+        domain = self._get_domain(url)
+        parser = self._get_robot_parser(domain)
+        
+        # If parser couldn't be initialized, we default to allowing access (standard practice).
+        if parser is None:
+            return True
+            
+        # Check permission using the configured User-Agent
+        path = urlparse(url).path
+        allowed = parser.can_fetch(self.user_agent, path)
+        
+        if not allowed:
+            print(f"   -> [ROBOTS] Disallowed by robots.txt: {url}")
+            
+        return allowed
+        
     # --- Database Methods ---
 
     def _connect_db(self):
@@ -199,7 +258,6 @@ class UnrestrictedWebSpider:
         count = 0
 
         if not requests_to_process:
-            # print("[REQUESTS] No pending user crawl requests found.")
             return
 
         print(f"[REQUESTS] Processing {len(requests_to_process)} user crawl requests.")
@@ -211,7 +269,6 @@ class UnrestrictedWebSpider:
             normalized_url = self._normalize_url(raw_url)
 
             if normalized_url:
-                # Use the new centralized queuing function
                 if not self._is_url_known(normalized_url):
                     self._add_to_queue_db(normalized_url, 0, parent_url="USER_REQUEST")
                     count += 1
@@ -241,6 +298,7 @@ class UnrestrictedWebSpider:
             "blacklisted_domains": list(self.blacklisted_domains),
             "strict_domain_mode": self.strict_domain_mode,
             "crawl_external_but_dont_save": self.crawl_external_but_dont_save,
+            "robots_enabled": self.robots_enabled, # Save robots state
             "timestamp": time.time()
         }
 
@@ -269,6 +327,7 @@ class UnrestrictedWebSpider:
             self.domain_counts = state.get("domain_counts", {})
             self.strict_domain_mode = state.get("strict_domain_mode", False)
             self.crawl_external_but_dont_save = state.get("crawl_external_but_dont_save", False)
+            self.robots_enabled = state.get("robots_enabled", True) # Load robots state
 
 
             # Load domain filtering settings
@@ -500,8 +559,11 @@ class UnrestrictedWebSpider:
         """Main crawling loop (BFS) with filtering, synchronization and cooldown."""
 
         print(f"Starting UNRESTRICTED, PERSISTENT crawl using MongoDB.")
-        if self.max_pages_per_domain != UNLIMITED:
-            print(f"Domain limit set to {int(self.max_pages_per_domain)} pages per domain.")
+        if self.robots_enabled:
+            print(f"Robots Exclusion Protocol enforcement: ENABLED (User-Agent: {self.user_agent})")
+        else:
+            print("Robots Exclusion Protocol enforcement: DISABLED")
+
 
         try:
             while self.to_visit and (self.indexed_count < self.max_pages or self.max_pages == UNLIMITED):
@@ -523,8 +585,15 @@ class UnrestrictedWebSpider:
                 queue_status = self.queue_collection.find_one({"_id": current_url}, projection={"status": 1})
                 if queue_status and queue_status.get('status') != 'pending':
                     continue
+                    
+                # --- NEW: Robots.txt Check ---
+                if not self._is_url_allowed_by_robots(current_url):
+                    self.queue_collection.update_one({"_id": current_url}, {"$set": {"status": "disallowed_robots"}})
+                    self.skipped_count += 1
+                    continue
+                # -----------------------------
 
-                # Fetch the page (We fetch it if it's in the queue, regardless of domain, unless strict mode prevented queuing)
+                # Fetch the page
                 html_content = self._fetch_page(current_url, current_depth)
 
                 if html_content:
@@ -644,10 +713,10 @@ if __name__ == "__main__":
     RESUME_CRAWL = DEFAULT_CONFIG["RESUME_CRAWL"]
     MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", DEFAULT_CONFIG["DB_NAME"])
     
-    # --- NEW TOGGLES ---
+    # --- TOGGLES ---
     STRICT_DOMAIN_MODE = DEFAULT_CONFIG["STRICT_DOMAIN_MODE"]
     CRAWL_EXTERNAL_BUT_DONT_SAVE = DEFAULT_CONFIG["CRAWL_EXTERNAL_BUT_DONT_SAVE"]
-
+    ROBOTS_ENABLED = DEFAULT_CONFIG["ROBOTS_ENABLED"] # Use default setting
 
     if not SEED_URLS and not RESUME_CRAWL:
         print("Warning: No initial SEED_URLS provided. Crawler will rely only on resumed state or user requests.")
@@ -656,14 +725,6 @@ if __name__ == "__main__":
         print("Error: MONGO_URI environment variable is required to run the crawler.")
     else:
         try:
-            # Example configuration for strict mode:
-            # STRICT_DOMAIN_MODE = True 
-            # CRAWL_EXTERNAL_BUT_DONT_SAVE = False
-            
-            # Example configuration for crawl external but don't save:
-            # STRICT_DOMAIN_MODE = False
-            # CRAWL_EXTERNAL_BUT_DONT_SAVE = True
-            
             crawler = UnrestrictedWebSpider(
                 start_urls=SEED_URLS,
                 max_pages=MAX_PAGES,
@@ -678,11 +739,9 @@ if __name__ == "__main__":
                 mongo_uri=MONGO_URI,
                 db_name=MONGO_DB_NAME,
                 strict_domain_mode=STRICT_DOMAIN_MODE,
-                crawl_external_but_dont_save=CRAWL_EXTERNAL_BUT_DONT_SAVE
+                crawl_external_but_dont_save=CRAWL_EXTERNAL_BUT_DONT_SAVE,
+                robots_enabled=ROBOTS_ENABLED 
             )
             crawler.crawl()
         except Exception as e:
             print(f"Crawler failed to initialize or run: {e}")
-
-
-
