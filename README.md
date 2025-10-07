@@ -4,7 +4,7 @@ A simple full-stack search engine pipeline, from crawling and indexing to servin
 
 Disclaimer: This code is a functional prototype. It is simplified, contains monolithic components, and lacks robust production-level error handling, security, and scaling features.
 
-**Simple Demo** `https://greysearch.onrender.com/`
+**Demo:** [https://greysearch.onrender.com/](https://greysearch.onrender.com/)
 
 ## ⚠️ The Unvarnished Look: Limitations and Simplifications
 
