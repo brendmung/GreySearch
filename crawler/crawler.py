@@ -17,9 +17,9 @@ UNLIMITED = float('inf')
 # --- Hardcoded Configuration Defaults (Replacing .env usage) ---
 # These values reflect the original .env.example defaults
 DEFAULT_CONFIG = {
-    "SEED_URLS": ["https://example.com", "https://another-example.org"],
+    "SEED_URLS": ["https://example.com", "https://https://en.wikipedia.org/wiki/Main_Page"],
     "MAX_PAGES": UNLIMITED,
-    "DEPTH_LIMIT": UNLIMITED,
+    "DEPTH_LIMIT": 2, #can set to unlimited
     "BATCH_SIZE": 50,
     "COOLDOWN_TIME": 10.0,
     "ALLOWED_DOMAINS": None, # Comma-separated list of domains to save (e.g., "*.co.zw,wikipedia.org")
@@ -519,4 +519,5 @@ if __name__ == "__main__":
             crawler.crawl()
         except Exception as e:
             print(f"Crawler failed to initialize or run: {e}")
+
 
