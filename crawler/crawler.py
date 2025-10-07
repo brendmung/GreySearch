@@ -9,9 +9,7 @@ from collections import deque
 from typing import List, Optional, Dict, Any, Set, Tuple
 # Removed: from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING
-from pymongo.errors import ConnectionError, OperationFailure
-
-# Note: We still rely on the environment for MONGO_URI, but all other config is internal.
+from pymongo.errors import OperationFailure
 
 # Use float('inf') to signify effectively unlimited crawling
 UNLIMITED = float('inf')
@@ -521,3 +519,4 @@ if __name__ == "__main__":
             crawler.crawl()
         except Exception as e:
             print(f"Crawler failed to initialize or run: {e}")
+
