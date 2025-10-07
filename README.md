@@ -42,7 +42,7 @@ The API saves user requests to `crawl_requests`, and the crawler polls this coll
 **3. The Breadcrumb Problem (Major Slowness):**
 The `_get_breadcrumb_path` function in the crawler is a known performance killer. To reconstruct the path a page was found through, it queries the `crawler_queue` collection repeatedly, following the `parent` field up the chain.
 
-> This means finding a page at depth 10 requires **10 separate database queries** just to save the breadcrumb path! For optimization, might need removal
+> This means finding a page at depth 10 requires **10 separate database queries** just to save the breadcrumb path! Might be removed in future.
 
 ---
 
