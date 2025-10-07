@@ -8,7 +8,7 @@ import os
 from collections import deque
 from typing import List, Optional, Dict, Any, Set, Tuple
 from pymongo import MongoClient, ASCENDING
-from pymongo.errors import OperationFailure
+from pymongo.errors import OperationFailure, DuplicateKeyError
 
 # Use float('inf') to signify effectively unlimited crawling
 UNLIMITED = float('inf')
@@ -33,6 +33,7 @@ DEFAULT_CONFIG = {
 class UnrestrictedWebSpider:
     """
     An UNRESTRICTED, persistent web spider using MongoDB for persistence.
+    Fixes the 'document too large' error by distributing URL state across a dedicated collection.
     """
 
     def __init__(self,
@@ -50,7 +51,8 @@ class UnrestrictedWebSpider:
                  db_name: str = "greysearch_db",
                  results_collection: str = "pages",
                  state_collection: str = "crawler_state",
-                 requests_collection: str = "crawl_requests"):
+                 requests_collection: str = "crawl_requests",
+                 queue_collection: str = "crawler_queue"): # New collection for URL state
 
         self.max_pages = max_pages
         self.depth_limit = depth_limit
@@ -66,6 +68,7 @@ class UnrestrictedWebSpider:
         self.results_collection_name = results_collection
         self.state_collection_name = state_collection
         self.requests_collection_name = requests_collection
+        self.queue_collection_name = queue_collection # New
 
         if not self.mongo_uri:
             raise ValueError("MongoDB URI must be provided via argument or MONGO_URI environment variable.")
@@ -75,26 +78,21 @@ class UnrestrictedWebSpider:
         self.results_collection = None
         self.state_collection = None
         self.requests_collection = None
+        self.queue_collection = None # New
         self._connect_db()
 
         # Domain filtering
-        # If allowed_domains is an empty list [], it evaluates to False, and self.allowed_domains becomes None,
-        # which correctly signals unrestricted crawling in _is_domain_allowed.
         self.allowed_domains = set(allowed_domains) if allowed_domains else None
         self.blacklisted_domains = set(blacklisted_domains) if blacklisted_domains else set()
 
-        self.visited: Set[str] = set()
-        # Queue stores tuples of (url, depth)
-        self.to_visit: deque[Tuple[str, int]] = deque()
+        # Queue stores tuples of (url, depth, parent_url_if_known)
+        self.to_visit: deque[Tuple[str, int, Optional[str]]] = deque()
         self.results_buffer: List[Dict[str, Any]] = []
         self.indexed_count = 0
         self.skipped_count = 0
         
         # Track indexed pages per domain
         self.domain_counts: Dict[str, int] = {}
-
-        # Breadcrumb tracking: url -> parent_url
-        self.breadcrumbs: Dict[str, str] = {}
 
         # Initialize or Load State
         if self.resume and self._load_state_db():
@@ -124,12 +122,17 @@ class UnrestrictedWebSpider:
             self.results_collection = self.db[self.results_collection_name]
             self.state_collection = self.db[self.state_collection_name]
             self.requests_collection = self.db[self.requests_collection_name]
+            self.queue_collection = self.db[self.queue_collection_name] # New Queue Collection
 
             # Ensure indexes for efficient searching and uniqueness
             self.results_collection.create_index([("url", ASCENDING)], unique=True)
             self.results_collection.create_index([("domain", ASCENDING)])
-            # Create a text index for fast full-text searching by the API
             self.results_collection.create_index([("title", "text"), ("content_snippet", "text")], name="text_search_index")
+            
+            # Index for the new queue collection
+            self.queue_collection.create_index([("status", ASCENDING)])
+            self.queue_collection.create_index([("depth", ASCENDING)])
+            # The _id field (URL) is implicitly unique
 
             print(f"[DB] Successfully connected to MongoDB database: {self.db_name}")
 
@@ -139,6 +142,33 @@ class UnrestrictedWebSpider:
         except OperationFailure as e:
             print(f"[DB ERROR] MongoDB operation failed (check credentials/permissions): {e}")
             raise
+
+    def _is_url_known(self, url: str) -> bool:
+        """Checks if the URL exists in the queue collection (i.e., has been visited, indexed, or is pending)."""
+        return self.queue_collection.find_one({"_id": url}, projection={"_id": 1}) is not None
+
+    def _add_to_queue_db(self, url: str, depth: int, parent_url: Optional[str] = None):
+        """Adds a new URL to the database queue and the in-memory queue."""
+        
+        # Check if already known (replaces self.visited check)
+        if self._is_url_known(url):
+            return
+
+        queue_doc = {
+            "_id": url,
+            "status": "pending",
+            "depth": depth,
+            "parent": parent_url,
+            "timestamp": time.time()
+        }
+        
+        try:
+            self.queue_collection.insert_one(queue_doc)
+            self.to_visit.append((url, depth, parent_url))
+        except DuplicateKeyError:
+            # Handle race condition where another process/thread added it
+            pass
+
 
     def _process_crawl_requests(self):
         """Fetches pending crawl requests from the DB and adds them to the queue."""
@@ -158,16 +188,14 @@ class UnrestrictedWebSpider:
             raw_url = request['url']
             normalized_url = self._normalize_url(raw_url)
 
-            if normalized_url and normalized_url not in self.visited:
-                # Check if it was already indexed
-                if self.results_collection.find_one({"url": normalized_url}):
-                    print(f"   -> Skipped requested URL (already indexed): {raw_url}")
-                else:
-                    self.to_visit.appendleft((normalized_url, 0)) # Add to the front for priority
-                    self.visited.add(normalized_url)
-                    self.breadcrumbs[normalized_url] = "USER_REQUEST"
+            if normalized_url:
+                # Use the new centralized queuing function
+                if not self._is_url_known(normalized_url):
+                    self._add_to_queue_db(normalized_url, 0, parent_url="USER_REQUEST")
                     count += 1
                     print(f"   -> Added requested URL to queue: {raw_url}")
+                else:
+                    print(f"   -> Skipped requested URL (already known): {raw_url}")
 
             requests_to_delete.append(request['_id'])
 
@@ -178,20 +206,16 @@ class UnrestrictedWebSpider:
 
 
     def _save_state_db(self):
-        """Saves the current crawl state to MongoDB."""
-        print(f"\n[STATE SAVE] Saving current queue/visited state to DB...")
+        """Saves the current crawl metadata (excluding large lists/sets) to MongoDB."""
+        print(f"\n[STATE SAVE] Saving current metadata to DB...")
 
-        to_visit_list = list(self.to_visit)
-
+        # Only save small, critical metadata
         state_document = {
             "_id": "current_state",
-            "visited": list(self.visited),
-            "to_visit": to_visit_list,
             "indexed_count": self.indexed_count,
             "skipped_count": self.skipped_count,
-            "breadcrumbs": self.breadcrumbs if self.save_breadcrumbs else {},
             "domain_counts": self.domain_counts,
-            "allowed_domains": list(self.allowed_domains) if self.allowed_domains else [], # Save as [] if None for consistency
+            "allowed_domains": list(self.allowed_domains) if self.allowed_domains else [],
             "blacklisted_domains": list(self.blacklisted_domains),
             "timestamp": time.time()
         }
@@ -202,55 +226,41 @@ class UnrestrictedWebSpider:
                 state_document,
                 upsert=True
             )
-            print("[STATE SAVE] State saved successfully.")
+            print("[STATE SAVE] Metadata saved successfully.")
         except Exception as e:
-            print(f"[STATE SAVE] Error saving state to DB: {e}")
+            # This error should now be highly unlikely unless domain_counts is huge
+            print(f"[STATE SAVE] Error saving metadata state to DB: {e}")
 
     def _load_state_db(self) -> bool:
-        """Loads the crawl state from MongoDB."""
+        """Loads the crawl state from MongoDB, rebuilding the queue from the dedicated collection."""
         try:
             state = self.state_collection.find_one({"_id": "current_state"})
 
             if not state:
-                print("No previous state found in DB. Starting fresh.")
+                print("No previous metadata state found in DB. Starting fresh.")
                 return False
 
-            self.visited = set(state.get("visited", []))
-
-            # Reconstruct deque from list of tuples
-            to_visit_list = state.get("to_visit", [])
-            # Ensure depth is an integer
-            self.to_visit = deque([(url, int(depth)) for url, depth in to_visit_list])
-
-            # Recalculate indexed count directly from the results collection for accuracy
-            self.indexed_count = self.results_collection.count_documents({})
+            # Load Metadata
+            self.indexed_count = state.get("indexed_count", 0)
             self.skipped_count = state.get("skipped_count", 0)
-            self.breadcrumbs = state.get("breadcrumbs", {})
             self.domain_counts = state.get("domain_counts", {})
 
-            # If domain counts are missing (e.g., resuming from an old state file), recalculate them
-            if not self.domain_counts and self.indexed_count > 0:
-                print("[DB LOAD] Recalculating domain counts from results collection...")
-                pipeline = [
-                    {"$group": {"_id": "$domain", "count": {"$sum": 1}}}
-                ]
-                counts = self.results_collection.aggregate(pipeline)
-                self.domain_counts = {item['_id']: item['count'] for item in counts}
-                print(f"[DB LOAD] Found counts for {len(self.domain_counts)} domains.")
-
-
             # Load domain filtering settings
-            # If loaded list is empty, set to None for unrestricted mode
             loaded_allowed = state.get("allowed_domains")
-            if loaded_allowed:
-                 self.allowed_domains = set(loaded_allowed)
-            else:
-                 self.allowed_domains = None
-                 
-            if "blacklisted_domains" in state:
-                self.blacklisted_domains = set(state["blacklisted_domains"])
+            self.allowed_domains = set(loaded_allowed) if loaded_allowed else None
+            self.blacklisted_domains = set(state.get("blacklisted_domains", []))
 
-            print(f"[DB LOAD] State loaded. Queue size: {len(self.to_visit)}")
+            # Rebuild in-memory queue from the queue collection
+            print("[DB LOAD] Rebuilding in-memory queue from persistent storage...")
+            pending_urls = self.queue_collection.find({"status": "pending"}).sort([("depth", ASCENDING)])
+            
+            queue_count = 0
+            for doc in pending_urls:
+                # (url, depth, parent_url)
+                self.to_visit.append((doc['_id'], doc['depth'], doc.get('parent')))
+                queue_count += 1
+
+            print(f"[DB LOAD] State loaded. Queue size rebuilt: {queue_count}")
             return True
 
         except Exception as e:
@@ -265,30 +275,30 @@ class UnrestrictedWebSpider:
         print(f"[DATA SYNC] Inserting {len(self.results_buffer)} new documents...")
 
         documents_to_insert = self.results_buffer
+        self.results_buffer = [] # Clear buffer immediately
 
         try:
             # Use insert_many for efficiency
             self.results_collection.insert_many(documents_to_insert, ordered=False)
 
             inserted_count = len(documents_to_insert)
-            self.results_buffer.clear()
             print(f"[DATA SYNC] Synchronization complete. Inserted {inserted_count} documents.")
 
         except Exception as e:
-            # Handle duplicate key errors gracefully (often happens during concurrent runs or resume)
+            # Handle duplicate key errors gracefully
             if "duplicate key error" in str(e):
                 print("[DATA SYNC] Warning: Detected potential duplicate key errors. Retrying individual inserts.")
-
                 successful_inserts = 0
                 for doc in documents_to_insert:
                     try:
                         self.results_collection.insert_one(doc)
                         successful_inserts += 1
-                    except Exception:
+                    except DuplicateKeyError:
                         pass # Skip duplicates
-
+                    except Exception as inner_e:
+                        print(f"Error during individual insert: {inner_e}")
+                        
                 print(f"[DATA SYNC] Retried batch insert. Successfully inserted {successful_inserts} documents.")
-                self.results_buffer.clear()
             else:
                 print(f"[DATA SYNC] Critical error saving incremental results to DB: {e}")
 
@@ -313,7 +323,6 @@ class UnrestrictedWebSpider:
             
         # Check allowed list
         if self.allowed_domains is None: 
-            # If allowed_domains is None (default when [] is passed), crawling is unrestricted
             return True
             
         for allowed in self.allowed_domains:
@@ -330,10 +339,10 @@ class UnrestrictedWebSpider:
         print("Initializing seeds...")
         for url in start_urls:
             normalized_url = self._normalize_url(url)
-            if normalized_url and normalized_url not in self.visited:
-                self.to_visit.append((normalized_url, 0))
-                self.visited.add(normalized_url)
-                self.breadcrumbs[normalized_url] = None
+            if normalized_url:
+                # Use the new centralized queuing function
+                self._add_to_queue_db(normalized_url, 0, parent_url=None)
+
 
     def _normalize_url(self, url: str) -> str:
         url = url.strip()
@@ -348,16 +357,13 @@ class UnrestrictedWebSpider:
         parsed = urlparse(url)
         if parsed.scheme not in ['http', 'https']: return False
         
-        # 1. Filter out common file extensions
+        # Filter out common file extensions
         if re.search(r'\.(pdf|jpg|jpeg|png|gif|zip|rar|exe|svg|css|js|xml|txt)$', parsed.path.lower()): return False
-        
-        # 2. REMOVED: Wikipedia Namespace Filtering. The spider is now general purpose.
         
         return True
 
-    def _fetch_page(self, url: str) -> Optional[str]:
+    def _fetch_page(self, url: str, current_depth: int) -> Optional[str]:
         try:
-            current_depth = self.to_visit[0][1] if self.to_visit else 0
             domain_info = f"[{self._get_domain(url)}]"
             print(f"D:{current_depth} | Indexed: {self.indexed_count} | Skipped: {self.skipped_count} | Queue: {len(self.to_visit)} | {domain_info} {url}")
             time.sleep(self.delay)
@@ -416,13 +422,21 @@ class UnrestrictedWebSpider:
         }
 
     def _get_breadcrumb_path(self, url: str) -> List[str]:
+        """Reconstructs the path by querying the queue collection iteratively."""
         path = []
         current = url
         seen = set()
+        
+        # We must query the DB for the parent chain
         while current and current not in seen:
             path.insert(0, current)
             seen.add(current)
-            current = self.breadcrumbs.get(current)
+            
+            doc = self.queue_collection.find_one({"_id": current}, projection={"parent": 1})
+            if doc and doc.get('parent'):
+                current = doc['parent']
+            else:
+                current = None
         return path
 
 
@@ -438,33 +452,39 @@ class UnrestrictedWebSpider:
         try:
             while self.to_visit and (self.indexed_count < self.max_pages or self.max_pages == UNLIMITED):
 
-                # Check for new user requests periodically (e.g., every 100 pages crawled)
+                # Check for new user requests periodically
                 if self.batch_counter == 0 and self.indexed_count > 0:
                     self._process_crawl_requests()
 
-                current_url, current_depth = self.to_visit.popleft()
+                # to_visit now contains (url, depth, parent_url)
+                current_url, current_depth, parent_url = self.to_visit.popleft()
 
                 if current_depth >= self.depth_limit:
+                    # Update status in DB to 'skipped' due to depth limit
+                    self.queue_collection.update_one({"_id": current_url}, {"$set": {"status": "skipped"}})
+                    self.skipped_count += 1
                     continue
 
-                # Check if URL was already indexed (important for resume)
-                if self.results_collection.find_one({"url": current_url}):
-                    self.visited.add(current_url)
+                # Check if URL was already indexed/skipped (should be handled by _load_state_db, but good safety check)
+                queue_status = self.queue_collection.find_one({"_id": current_url}, projection={"status": 1})
+                if queue_status and queue_status.get('status') != 'pending':
                     continue
 
-                html_content = self._fetch_page(current_url)
+                html_content = self._fetch_page(current_url, current_depth)
 
                 if html_content:
                     extracted_data = self._extract_data(html_content, current_url)
-
+                    domain = self._get_domain(current_url)
+                    
                     if self._should_save_page(current_url):
-                        domain = self._get_domain(current_url)
                         
                         # Domain Limit Check before indexing
                         current_domain_count = self.domain_counts.get(domain, 0)
                         if self.max_pages_per_domain != UNLIMITED and current_domain_count >= self.max_pages_per_domain:
                             print(f"   -> Domain limit reached for {domain} ({current_domain_count}/{int(self.max_pages_per_domain)}). Skipping indexing.")
                             self.skipped_count += 1
+                            # Update status in DB
+                            self.queue_collection.update_one({"_id": current_url}, {"$set": {"status": "skipped"}})
                         else:
                             # Index the page and update counts
                             document = {
@@ -478,14 +498,22 @@ class UnrestrictedWebSpider:
                             }
 
                             if self.save_breadcrumbs:
+                                # Breadcrumb path is dynamically generated using parent links stored in the queue collection
                                 document["breadcrumb_path"] = self._get_breadcrumb_path(current_url)
-                                document["parent_url"] = self.breadcrumbs.get(current_url)
+                                document["parent_url"] = parent_url
 
                             self.results_buffer.append(document)
                             self.indexed_count += 1
                             self.domain_counts[domain] = current_domain_count + 1 # Increment domain count
+                            
+                            # Update status in DB to 'indexed'
+                            self.queue_collection.update_one({"_id": current_url}, {"$set": {"status": "indexed"}})
+
                     else:
                         self.skipped_count += 1
+                        # Update status in DB to 'skipped'
+                        self.queue_collection.update_one({"_id": current_url}, {"$set": {"status": "skipped"}})
+
 
                     self.batch_counter += 1
 
@@ -497,25 +525,27 @@ class UnrestrictedWebSpider:
                         # Pre-check domain limit before queuing
                         if self.max_pages_per_domain != UNLIMITED:
                             if self.domain_counts.get(link_domain, 0) >= self.max_pages_per_domain:
-                                # Don't queue links for domains that have already hit their quota
                                 continue
 
-                        if link not in self.visited:
-                            self.visited.add(link)
-                            self.to_visit.append((link, next_depth))
-                            if self.save_breadcrumbs:
-                                self.breadcrumbs[link] = current_url
+                        # Use the centralized queuing function
+                        self._add_to_queue_db(link, next_depth, parent_url=current_url)
 
                     # Synchronization and Rate Limiting Check
                     if self.batch_counter >= self.crawl_batch_size:
                         self._save_incremental_results_db()
-                        self._save_state_db()
+                        self._save_state_db() # Save metadata state
 
                         print(f"\n[COOLDOWN] Crawled {self.crawl_batch_size} pages. Resting for {self.cooldown_seconds} seconds...")
                         time.sleep(self.cooldown_seconds)
                         print("[COOLDOWN] Resuming crawl.")
 
                         self.batch_counter = 0
+                
+                else:
+                    # If fetch failed, mark as skipped/failed in queue collection
+                    self.queue_collection.update_one({"_id": current_url}, {"$set": {"status": "skipped"}})
+                    self.skipped_count += 1
+
 
         except KeyboardInterrupt:
             print("\n!!! Crawl interrupted by user (Ctrl+C) !!!")
@@ -569,7 +599,7 @@ if __name__ == "__main__":
                 resume=RESUME_CRAWL,
                 crawl_batch_size=BATCH_SIZE,
                 cooldown_seconds=COOLDOWN_TIME,
-                allowed_domains=ALLOWED_DOMAINS, # This is now [] (unrestricted)
+                allowed_domains=ALLOWED_DOMAINS,
                 blacklisted_domains=BLACKLISTED_DOMAINS,
                 save_breadcrumbs=ENABLE_BREADCRUMBS,
                 mongo_uri=MONGO_URI,
