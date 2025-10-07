@@ -99,3 +99,7 @@ const API_BASE_URL = 'https://greysearch-api.onrender.com/api';
 If you run this locally, you must change this to point to your local Node.js server (e.g., `http://localhost:3000/api`).
 
 The frontend handles the search flow, pagination, and the submission of new crawl requests, providing immediate feedback (success/error messages) based on the API response.
+
+## 📄 License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
