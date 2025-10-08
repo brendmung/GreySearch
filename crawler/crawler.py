@@ -21,19 +21,19 @@ UNLIMITED = float('inf')
 
 # --- Hardcoded Configuration Defaults ---
 DEFAULT_CONFIG = {
-    "SEED_URLS": ["https://keid-lists.pages.dev"],
+    "SEED_URLS": ["https://github.com","https://en.wikipedia.org/wiki"],
     "MAX_PAGES": UNLIMITED,
     "DEPTH_LIMIT": 2, 
     "MAX_PAGES_PER_DOMAIN": 300, 
-    "BATCH_SIZE": 50,
+    "BATCH_SIZE": 20,
     "COOLDOWN_TIME": 10.0,
     "ALLOWED_DOMAINS": [], 
     "BLACKLISTED_DOMAINS": [],
     "ENABLE_BREADCRUMBS": True,
     "RESUME_CRAWL": True,
     "DB_NAME": "greysearch_db",
-    "STRICT_DOMAIN_MODE": False,
-    "CRAWL_EXTERNAL_BUT_DONT_SAVE": True,
+    "STRICT_DOMAIN_MODE": True,
+    "CRAWL_EXTERNAL_BUT_DONT_SAVE": False,
     "ROBOTS_ENABLED": False, #temporary
     "MAX_QUEUE_MEMORY_SIZE": 10000  # Limit in-memory queue size
 }
@@ -915,5 +915,6 @@ if __name__ == "__main__":
             print(f"Crawler failed to initialize or run: {e}")
             import traceback
             traceback.print_exc()
+
 
 
