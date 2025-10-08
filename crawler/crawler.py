@@ -9,8 +9,12 @@ from collections import deque
 from typing import List, Optional, Dict, Any, Set, Tuple
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import OperationFailure, DuplicateKeyError
-import urllib.robotparser # Import for robots.txt handling
-from urllib.robotparser import RobotFileParser # Specific class import
+from urllib.robotparser import RobotFileParser
+
+# --- New Imports for Web Server Wrapper ---
+from flask import Flask
+import threading
+# ------------------------------------------
 
 # Use float('inf') to signify effectively unlimited crawling
 UNLIMITED = float('inf')
@@ -30,7 +34,8 @@ DEFAULT_CONFIG = {
     "DB_NAME": "greysearch_db",
     "STRICT_DOMAIN_MODE": False,
     "CRAWL_EXTERNAL_BUT_DONT_SAVE": True,
-    "ROBOTS_ENABLED": False #temporary, for testing
+    "ROBOTS_ENABLED": True,
+    "MAX_QUEUE_MEMORY_SIZE": 10000  # Limit in-memory queue size
 }
 # -----------------------------------------------------------------
 
@@ -38,7 +43,7 @@ DEFAULT_CONFIG = {
 class UnrestrictedWebSpider:
     """
     An UNRESTRICTED, persistent web spider using MongoDB for persistence.
-    Now includes respect for robots.txt.
+    Now includes respect for robots.txt with improved efficiency and error handling.
     """
 
     def __init__(self,
@@ -60,7 +65,8 @@ class UnrestrictedWebSpider:
                  queue_collection: str = "crawler_queue",
                  strict_domain_mode: bool = False,
                  crawl_external_but_dont_save: bool = False,
-                 robots_enabled: bool = True): # Added robots_enabled parameter
+                 robots_enabled: bool = True,
+                 max_queue_memory_size: int = 10000):
 
         self.max_pages = max_pages
         self.depth_limit = depth_limit
@@ -69,11 +75,18 @@ class UnrestrictedWebSpider:
         self.crawl_batch_size = crawl_batch_size
         self.cooldown_seconds = cooldown_seconds
         self.save_breadcrumbs = save_breadcrumbs
+        self.max_queue_memory_size = max_queue_memory_size
+        
+        # Set user agent BEFORE any robots.txt operations
+        self.user_agent = 'UnrestrictedWebSpiderBot/1.0 (Persistent Internet Mapping - Use with extreme caution)'
+        self.headers = {
+            'User-Agent': self.user_agent
+        }
         
         # --- NEW TOGGLE ASSIGNMENTS ---
         self.strict_domain_mode = strict_domain_mode
         self.crawl_external_but_dont_save = crawl_external_but_dont_save
-        self.robots_enabled = robots_enabled # Assign robots flag
+        self.robots_enabled = robots_enabled
 
         # MongoDB configuration
         self.mongo_uri = mongo_uri or os.getenv("MONGO_URI")
@@ -118,8 +131,10 @@ class UnrestrictedWebSpider:
         # Track indexed pages per domain
         self.domain_counts: Dict[str, int] = {}
         
-        # Robot exclusion protocol cache
-        self.robots_parsers: Dict[str, RobotFileParser] = {} 
+        # Robot exclusion protocol cache with LRU limit
+        self.robots_parsers: Dict[str, RobotFileParser] = {}
+        self.robots_cache_max_size = 1000
+        self.robots_access_order: deque[str] = deque()
 
         # Initialize or Load State
         if self.resume and self._load_state_db():
@@ -130,11 +145,6 @@ class UnrestrictedWebSpider:
         # Process user requests immediately after initialization
         self._process_crawl_requests()
 
-        self.headers = {
-            'User-Agent': 'UnrestrictedWebSpiderBot/1.0 (Persistent Internet Mapping - Use with extreme caution)'
-        }
-        self.user_agent = self.headers['User-Agent'] # Store User-Agent for robots check
-
         self.delay = 0.5
         self.batch_counter = 0
 
@@ -143,31 +153,45 @@ class UnrestrictedWebSpider:
     def _get_robot_parser(self, domain: str) -> Optional[RobotFileParser]:
         """
         Fetches, parses, and caches the robots.txt file for a given domain.
-        Tries HTTPS first, falls back to HTTP.
+        Tries HTTPS first, falls back to HTTP. Implements LRU cache eviction.
         """
         if domain in self.robots_parsers:
+            # Update access order for LRU
+            self.robots_access_order.remove(domain)
+            self.robots_access_order.append(domain)
             return self.robots_parsers[domain]
         
         parser = RobotFileParser()
         
         # Attempt 1: HTTPS
         robots_url_https = f"https://{domain}/robots.txt"
-        parser.set_url(robots_url_https)
         
         try:
-            parser.read()
+            response = requests.get(robots_url_https, timeout=10, headers=self.headers)
             
-            # If mtime is 0, the attempt failed (e.g., 404, connection error). Try HTTP fallback.
-            if parser.mtime() == 0:
+            if response.status_code == 200:
+                parser.parse(response.text.splitlines())
+            else:
+                # Try HTTP fallback
                 robots_url_http = f"http://{domain}/robots.txt"
-                parser.set_url(robots_url_http)
-                parser.read()
+                try:
+                    response = requests.get(robots_url_http, timeout=10, headers=self.headers)
+                    if response.status_code == 200:
+                        parser.parse(response.text.splitlines())
+                except Exception:
+                    pass  # If both fail, parser remains empty (allows all)
 
         except Exception as e:
-            print(f"[ROBOTS] Severe error fetching robots.txt for {domain}: {e}")
-            # On severe error, the parser is cached but likely empty, defaulting to allow all.
-            
+            print(f"[ROBOTS] Error fetching robots.txt for {domain}: {e}")
+            # On error, parser remains empty, defaulting to allow all
+        
+        # Cache the parser with LRU eviction
+        if len(self.robots_parsers) >= self.robots_cache_max_size:
+            oldest_domain = self.robots_access_order.popleft()
+            del self.robots_parsers[oldest_domain]
+        
         self.robots_parsers[domain] = parser
+        self.robots_access_order.append(domain)
         return parser
 
     def _is_url_allowed_by_robots(self, url: str) -> bool:
@@ -178,13 +202,11 @@ class UnrestrictedWebSpider:
         domain = self._get_domain(url)
         parser = self._get_robot_parser(domain)
         
-        # If parser couldn't be initialized, we default to allowing access (standard practice).
         if parser is None:
             return True
             
         # Check permission using the configured User-Agent
-        path = urlparse(url).path
-        allowed = parser.can_fetch(self.user_agent, path)
+        allowed = parser.can_fetch(self.user_agent, url)
         
         if not allowed:
             print(f"   -> [ROBOTS] Disallowed by robots.txt: {url}")
@@ -197,7 +219,7 @@ class UnrestrictedWebSpider:
         """Establishes connection to MongoDB and sets up necessary indexes."""
         try:
             self.client = MongoClient(self.mongo_uri, serverSelectionTimeoutMS=5000)
-            self.client.admin.command('ping') # Test connection
+            self.client.admin.command('ping')
 
             self.db = self.client[self.db_name]
             self.results_collection = self.db[self.results_collection_name]
@@ -208,33 +230,38 @@ class UnrestrictedWebSpider:
             # Ensure indexes for efficient searching and uniqueness
             self.results_collection.create_index([("url", ASCENDING)], unique=True)
             self.results_collection.create_index([("domain", ASCENDING)])
-            self.results_collection.create_index([("title", "text"), ("content_snippet", "text")], name="text_search_index")
             
-            # Index for the new queue collection
+            # Create text index only if it doesn't exist
+            try:
+                self.results_collection.create_index(
+                    [("title", "text"), ("content_snippet", "text")], 
+                    name="text_search_index"
+                )
+            except OperationFailure:
+                pass  # Index already exists
+            
+            # Index for the queue collection
             self.queue_collection.create_index([("status", ASCENDING)])
             self.queue_collection.create_index([("depth", ASCENDING)])
-            # The _id field (URL) is implicitly unique
+            self.queue_collection.create_index([("status", ASCENDING), ("depth", ASCENDING)])
 
             print(f"[DB] Successfully connected to MongoDB database: {self.db_name}")
 
-        except ConnectionError as e:
-            print(f"[DB ERROR] Could not connect to MongoDB. Check MONGO_URI: {e}")
-            raise
-        except OperationFailure as e:
-            print(f"[DB ERROR] MongoDB operation failed (check credentials/permissions): {e}")
+        except Exception as e:
+            print(f"[DB ERROR] Could not connect to MongoDB: {e}")
             raise
 
     def _is_url_known(self, url: str) -> bool:
-        """Checks if the URL exists in the queue collection (i.e., has been visited, indexed, or is pending)."""
-        return self.queue_collection.find_one({"_id": url}, projection={"_id": 1}) is not None
+        """Checks if the URL exists in the queue collection (optimized with index)."""
+        try:
+            return self.queue_collection.find_one({"_id": url}, projection={"_id": 1}) is not None
+        except Exception as e:
+            print(f"[DB ERROR] Error checking if URL is known: {e}")
+            return False
 
     def _add_to_queue_db(self, url: str, depth: int, parent_url: Optional[str] = None):
-        """Adds a new URL to the database queue and the in-memory queue."""
+        """Adds a new URL to the database queue and the in-memory queue (atomic operation)."""
         
-        # Check if already known (replaces self.visited check)
-        if self._is_url_known(url):
-            return
-
         queue_doc = {
             "_id": url,
             "status": "pending",
@@ -244,51 +271,81 @@ class UnrestrictedWebSpider:
         }
         
         try:
+            # Use insert_one which will fail on duplicate (atomic check + insert)
             self.queue_collection.insert_one(queue_doc)
-            self.to_visit.append((url, depth, parent_url))
+            
+            # Only add to memory queue if we successfully inserted to DB
+            if len(self.to_visit) < self.max_queue_memory_size:
+                self.to_visit.append((url, depth, parent_url))
+            # If memory queue is full, items will be loaded from DB later
+            
         except DuplicateKeyError:
-            # Handle race condition where another process/thread added it
+            # URL already exists, skip silently
             pass
+        except Exception as e:
+            print(f"[DB ERROR] Error adding URL to queue: {e}")
 
+    def _load_next_batch_from_queue(self, batch_size: int = 100):
+        """Loads the next batch of pending URLs from the database into memory."""
+        try:
+            pending_urls = self.queue_collection.find(
+                {"status": "pending"}
+            ).sort([("depth", ASCENDING)]).limit(batch_size)
+            
+            count = 0
+            for doc in pending_urls:
+                if len(self.to_visit) < self.max_queue_memory_size:
+                    self.to_visit.append((doc['_id'], doc['depth'], doc.get('parent')))
+                    count += 1
+                else:
+                    break
+            
+            if count > 0:
+                print(f"[QUEUE] Loaded {count} URLs from database into memory queue")
+                
+        except Exception as e:
+            print(f"[DB ERROR] Error loading batch from queue: {e}")
 
     def _process_crawl_requests(self):
         """Fetches pending crawl requests from the DB and adds them to the queue."""
 
-        requests_to_process = list(self.requests_collection.find({"status": "pending"}))
-        count = 0
+        try:
+            requests_to_process = list(self.requests_collection.find({"status": "pending"}))
+            count = 0
 
-        if not requests_to_process:
-            return
+            if not requests_to_process:
+                return
 
-        print(f"[REQUESTS] Processing {len(requests_to_process)} user crawl requests.")
+            print(f"[REQUESTS] Processing {len(requests_to_process)} user crawl requests.")
 
-        requests_to_delete = []
+            requests_to_delete = []
 
-        for request in requests_to_process:
-            raw_url = request['url']
-            normalized_url = self._normalize_url(raw_url)
+            for request in requests_to_process:
+                raw_url = request.get('url', '')
+                normalized_url = self._normalize_url(raw_url)
 
-            if normalized_url:
-                if not self._is_url_known(normalized_url):
-                    self._add_to_queue_db(normalized_url, 0, parent_url="USER_REQUEST")
-                    count += 1
-                    print(f"   -> Added requested URL to queue: {raw_url}")
-                else:
-                    print(f"   -> Skipped requested URL (already known): {raw_url}")
+                if normalized_url:
+                    if not self._is_url_known(normalized_url):
+                        self._add_to_queue_db(normalized_url, 0, parent_url="USER_REQUEST")
+                        count += 1
+                        print(f"   -> Added requested URL to queue: {raw_url}")
+                    else:
+                        print(f"   -> Skipped requested URL (already known): {raw_url}")
 
-            requests_to_delete.append(request['_id'])
+                requests_to_delete.append(request['_id'])
 
-        # Clean up processed requests
-        if requests_to_delete:
-            self.requests_collection.delete_many({"_id": {"$in": requests_to_delete}})
-            print(f"[REQUESTS] Successfully added {count} new seed URLs and cleared {len(requests_to_delete)} requests.")
-
+            # Clean up processed requests
+            if requests_to_delete:
+                self.requests_collection.delete_many({"_id": {"$in": requests_to_delete}})
+                print(f"[REQUESTS] Successfully added {count} new seed URLs and cleared {len(requests_to_delete)} requests.")
+                
+        except Exception as e:
+            print(f"[REQUESTS ERROR] Error processing crawl requests: {e}")
 
     def _save_state_db(self):
-        """Saves the current crawl metadata (excluding large lists/sets) to MongoDB."""
+        """Saves the current crawl metadata to MongoDB."""
         print(f"\n[STATE SAVE] Saving current metadata to DB...")
 
-        # Only save small, critical metadata
         state_document = {
             "_id": "current_state",
             "indexed_count": self.indexed_count,
@@ -298,7 +355,7 @@ class UnrestrictedWebSpider:
             "blacklisted_domains": list(self.blacklisted_domains),
             "strict_domain_mode": self.strict_domain_mode,
             "crawl_external_but_dont_save": self.crawl_external_but_dont_save,
-            "robots_enabled": self.robots_enabled, # Save robots state
+            "robots_enabled": self.robots_enabled,
             "timestamp": time.time()
         }
 
@@ -310,7 +367,7 @@ class UnrestrictedWebSpider:
             )
             print("[STATE SAVE] Metadata saved successfully.")
         except Exception as e:
-            print(f"[STATE SAVE] Error saving metadata state to DB: {e}")
+            print(f"[STATE SAVE ERROR] Error saving metadata state to DB: {e}")
 
     def _load_state_db(self) -> bool:
         """Loads the crawl state from MongoDB, rebuilding the queue from the dedicated collection."""
@@ -327,30 +384,22 @@ class UnrestrictedWebSpider:
             self.domain_counts = state.get("domain_counts", {})
             self.strict_domain_mode = state.get("strict_domain_mode", False)
             self.crawl_external_but_dont_save = state.get("crawl_external_but_dont_save", False)
-            self.robots_enabled = state.get("robots_enabled", True) # Load robots state
-
+            self.robots_enabled = state.get("robots_enabled", True)
 
             # Load domain filtering settings
             loaded_allowed = state.get("allowed_domains")
             self.allowed_domains = set(loaded_allowed) if loaded_allowed else None
             self.blacklisted_domains = set(state.get("blacklisted_domains", []))
 
-            # Rebuild in-memory queue from the persistent queue collection
+            # Rebuild in-memory queue from the persistent queue collection (limited batch)
             print("[DB LOAD] Rebuilding in-memory queue from persistent storage...")
-            # We only load 'pending' items back into the in-memory queue
-            pending_urls = self.queue_collection.find({"status": "pending"}).sort([("depth", ASCENDING)])
-            
-            queue_count = 0
-            for doc in pending_urls:
-                # (url, depth, parent_url)
-                self.to_visit.append((doc['_id'], doc['depth'], doc.get('parent')))
-                queue_count += 1
+            self._load_next_batch_from_queue(self.max_queue_memory_size)
 
-            print(f"[DB LOAD] State loaded. Queue size rebuilt: {queue_count}")
+            print(f"[DB LOAD] State loaded. Initial queue size: {len(self.to_visit)}")
             return True
 
         except Exception as e:
-            print(f"Error loading state from DB: {e}. Starting fresh.")
+            print(f"[DB LOAD ERROR] Error loading state from DB: {e}. Starting fresh.")
             return False
 
     def _save_incremental_results_db(self):
@@ -361,37 +410,44 @@ class UnrestrictedWebSpider:
         print(f"[DATA SYNC] Inserting {len(self.results_buffer)} new documents...")
 
         documents_to_insert = self.results_buffer
-        self.results_buffer = [] # Clear buffer immediately
+        self.results_buffer = []
 
         try:
-            # Use insert_many for efficiency
-            self.results_collection.insert_many(documents_to_insert, ordered=False)
-
-            inserted_count = len(documents_to_insert)
-            print(f"[DATA SYNC] Synchronization complete. Inserted {inserted_count} documents.")
+            if len(documents_to_insert) == 1:
+                try:
+                    self.results_collection.insert_one(documents_to_insert[0])
+                    print(f"[DATA SYNC] Successfully inserted 1 document.")
+                except DuplicateKeyError:
+                    print(f"[DATA SYNC] Skipped 1 duplicate document.")
+            else:
+                try:
+                    result = self.results_collection.insert_many(documents_to_insert, ordered=False)
+                    inserted_count = len(result.inserted_ids)
+                    print(f"[DATA SYNC] Synchronization complete. Inserted {inserted_count} documents.")
+                except Exception as e:
+                    if "duplicate key error" in str(e).lower():
+                        print("[DATA SYNC] Warning: Some duplicate key errors detected. Attempting individual inserts.")
+                        successful_inserts = 0
+                        for doc in documents_to_insert:
+                            try:
+                                self.results_collection.insert_one(doc)
+                                successful_inserts += 1
+                            except DuplicateKeyError:
+                                pass
+                            except Exception as inner_e:
+                                print(f"[DATA SYNC ERROR] Error during individual insert: {inner_e}")
+                        print(f"[DATA SYNC] Successfully inserted {successful_inserts} documents after retry.")
+                    else:
+                        raise
 
         except Exception as e:
-            # Handle duplicate key errors gracefully
-            if "duplicate key error" in str(e):
-                print("[DATA SYNC] Warning: Detected potential duplicate key errors. Retrying individual inserts.")
-                successful_inserts = 0
-                for doc in documents_to_insert:
-                    try:
-                        self.results_collection.insert_one(doc)
-                        successful_inserts += 1
-                    except DuplicateKeyError:
-                        pass # Skip duplicates
-                    except Exception as inner_e:
-                        print(f"Error during individual insert: {inner_e}")
-                        
-                print(f"[DATA SYNC] Retried batch insert. Successfully inserted {successful_inserts} documents.")
-            else:
-                print(f"[DATA SYNC] Critical error saving incremental results to DB: {e}")
+            print(f"[DATA SYNC ERROR] Critical error saving incremental results to DB: {e}")
 
     # --- Domain Filtering Methods ---
     def _matches_domain_pattern(self, url: str, pattern: str) -> bool:
         domain = self._get_domain(url)
-        if domain == pattern: return True
+        if domain == pattern: 
+            return True
         if pattern.startswith('*.'):
             suffix = pattern[1:]
             return domain.endswith(suffix)
@@ -402,24 +458,25 @@ class UnrestrictedWebSpider:
 
     def _is_domain_allowed(self, url: str) -> bool:
         """
-        Checks if the URL's domain is allowed based on the configuration 
-        (i.e., not blacklisted AND either unrestricted or on the allowed list).
+        Checks if the URL's domain is allowed based on the configuration.
         This determines if a page is *saved*.
         """
         domain = self._get_domain(url)
         
         # Check blacklist first (always enforced)
         for blacklisted in self.blacklisted_domains:
-            if self._matches_domain_pattern(url, blacklisted): return False
+            if self._matches_domain_pattern(url, blacklisted): 
+                return False
             
         # Check allowed list
         if self.allowed_domains is None: 
-            return True # Unrestricted mode
+            return True
             
         for allowed in self.allowed_domains:
-            if self._matches_domain_pattern(url, allowed): return True
+            if self._matches_domain_pattern(url, allowed): 
+                return True
             
-        return False # Domain did not match any allowed pattern
+        return False
 
     def _should_queue_link(self, url: str) -> bool:
         """
@@ -429,22 +486,19 @@ class UnrestrictedWebSpider:
         # 1. Check blacklisting (always enforced)
         domain = self._get_domain(url)
         for blacklisted in self.blacklisted_domains:
-            if self._matches_domain_pattern(url, blacklisted): return False
+            if self._matches_domain_pattern(url, blacklisted): 
+                return False
 
         # 2. Check Strict Mode (Toggle 1)
         if self.strict_domain_mode:
-            # If strict, we only queue if it's in the allowed list (derived from seeds)
             return self._is_domain_allowed(url)
 
         # 3. Check Crawl External Mode (Toggle 2)
         if self.crawl_external_but_dont_save:
-            # If T2 is True, we queue everything (since blacklisting was checked above)
             return True
             
-        # 4. Standard Mode (T1=False, T2=False)
-        # We only queue if it passes the standard allowance rules (either explicitly allowed or unrestricted)
+        # 4. Standard Mode
         return self._is_domain_allowed(url)
-
 
     # --- Utility Methods ---
 
@@ -453,25 +507,29 @@ class UnrestrictedWebSpider:
         for url in start_urls:
             normalized_url = self._normalize_url(url)
             if normalized_url:
-                # Use the new centralized queuing function
                 self._add_to_queue_db(normalized_url, 0, parent_url=None)
 
-
     def _normalize_url(self, url: str) -> str:
+        if not url:
+            return ""
         url = url.strip()
         if not urlparse(url).scheme:
             url = "http://" + url
-        return url.split('#')[0]
+        # Remove fragment
+        url = url.split('#')[0]
+        return url
 
     def _get_domain(self, url: str) -> str:
         return urlparse(url).netloc
 
     def _is_valid_link(self, url: str) -> bool:
         parsed = urlparse(url)
-        if parsed.scheme not in ['http', 'https']: return False
+        if parsed.scheme not in ['http', 'https']: 
+            return False
         
         # Filter out common file extensions
-        if re.search(r'\.(pdf|jpg|jpeg|png|gif|zip|rar|exe|svg|css|js|xml|txt)$', parsed.path.lower()): return False
+        if re.search(r'\.(pdf|jpg|jpeg|png|gif|zip|rar|exe|svg|css|js|xml|txt|mp4|mp3|avi|mov|wmv|flv|doc|docx|xls|xlsx|ppt|pptx)$', parsed.path.lower()): 
+            return False
         
         return True
 
@@ -480,21 +538,28 @@ class UnrestrictedWebSpider:
             domain_info = f"[{self._get_domain(url)}]"
             print(f"D:{current_depth} | Indexed: {self.indexed_count} | Skipped: {self.skipped_count} | Queue: {len(self.to_visit)} | {domain_info} {url}")
             time.sleep(self.delay)
-            response = requests.get(url, headers=self.headers, timeout=20)
+            response = requests.get(url, headers=self.headers, timeout=20, allow_redirects=True)
             response.raise_for_status()
-            if 'text/html' in response.headers.get('Content-Type', ''):
+            
+            content_type = response.headers.get('Content-Type', '').lower()
+            if 'text/html' in content_type:
                 response.encoding = response.apparent_encoding
                 return response.text
             else:
                 return None
-        except requests.exceptions.RequestException:
+                
+        except requests.exceptions.RequestException as e:
+            print(f"   -> [FETCH ERROR] Failed to fetch {url}: {e}")
+            return None
+        except Exception as e:
+            print(f"   -> [FETCH ERROR] Unexpected error fetching {url}: {e}")
             return None
 
     def _find_favicon_url(self, soup: BeautifulSoup, current_url: str) -> str:
         icon_tags = soup.find_all('link', rel=re.compile(r'(icon|shortcut icon|apple-touch-icon)', re.I))
         if icon_tags and icon_tags[0].get('href'):
             return urljoin(current_url, icon_tags[0].get('href'))
-        base_url = urlparse(current_url).scheme + "://" + urlparse(current_url).netloc
+        base_url = f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}"
         return urljoin(base_url, '/favicon.ico')
 
     def _extract_data(self, html_content: str, current_url: str) -> Dict[str, Any]:
@@ -539,59 +604,101 @@ class UnrestrictedWebSpider:
         path = []
         current = url
         seen = set()
+        max_depth = 100  # Prevent infinite loops
         
-        # We must query the DB for the parent chain
-        while current and current not in seen:
-            path.insert(0, current)
-            seen.add(current)
+        try:
+            while current and current not in seen and len(path) < max_depth:
+                path.insert(0, current)
+                seen.add(current)
+                
+                doc = self.queue_collection.find_one({"_id": current}, projection={"parent": 1})
+                if doc and doc.get('parent') and doc.get('parent') != "USER_REQUEST":
+                    current = doc['parent']
+                else:
+                    current = None
+                    
+        except Exception as e:
+            print(f"[BREADCRUMB ERROR] Error building breadcrumb: {e}")
             
-            doc = self.queue_collection.find_one({"_id": current}, projection={"parent": 1})
-            if doc and doc.get('parent'):
-                current = doc['parent']
-            else:
-                current = None
         return path
-
 
     # --- Main Crawl Loop ---
 
     def crawl(self):
         """Main crawling loop (BFS) with filtering, synchronization and cooldown."""
 
-        print(f"Starting UNRESTRICTED, PERSISTENT crawl using MongoDB.")
+        print(f"\nStarting UNRESTRICTED, PERSISTENT crawl using MongoDB.")
+        print(f"Configuration:")
+        print(f"  - Max Pages: {'Unlimited' if self.max_pages == UNLIMITED else self.max_pages}")
+        print(f"  - Depth Limit: {'Unlimited' if self.depth_limit == UNLIMITED else self.depth_limit}")
+        print(f"  - Max Pages Per Domain: {'Unlimited' if self.max_pages_per_domain == UNLIMITED else self.max_pages_per_domain}")
+        print(f"  - Strict Domain Mode: {self.strict_domain_mode}")
+        print(f"  - Crawl External But Don't Save: {self.crawl_external_but_dont_save}")
+        print(f"  - Robots.txt Enforcement: {'ENABLED' if self.robots_enabled else 'DISABLED'}")
         if self.robots_enabled:
-            print(f"Robots Exclusion Protocol enforcement: ENABLED (User-Agent: {self.user_agent})")
-        else:
-            print("Robots Exclusion Protocol enforcement: DISABLED")
-
+            print(f"  - User-Agent: {self.user_agent}")
+        print()
 
         try:
-            while self.to_visit and (self.indexed_count < self.max_pages or self.max_pages == UNLIMITED):
+            while (self.indexed_count < self.max_pages or self.max_pages == UNLIMITED):
+                
+                # If in-memory queue is empty or low, try to load more from DB
+                if len(self.to_visit) < 100:
+                    self._load_next_batch_from_queue(500)
+                
+                # Check if we truly have no more URLs
+                if not self.to_visit:
+                    # Double-check database for any pending URLs we might have missed
+                    pending_count = self.queue_collection.count_documents({"status": "pending"})
+                    if pending_count > 0:
+                        print(f"[QUEUE] Found {pending_count} pending URLs in database, loading more...")
+                        self._load_next_batch_from_queue(500)
+                    
+                    if not self.to_visit:
+                        print("[CRAWL] No more URLs to visit. Crawl complete.")
+                        break
 
                 # Check for new user requests periodically
                 if self.batch_counter == 0 and self.indexed_count > 0:
                     self._process_crawl_requests()
 
-                # to_visit now contains (url, depth, parent_url)
                 current_url, current_depth, parent_url = self.to_visit.popleft()
 
+                # Check depth limit
                 if current_depth >= self.depth_limit:
-                    # Update status in DB to 'skipped' due to depth limit
-                    self.queue_collection.update_one({"_id": current_url}, {"$set": {"status": "skipped"}})
+                    try:
+                        self.queue_collection.update_one(
+                            {"_id": current_url}, 
+                            {"$set": {"status": "skipped_depth"}}
+                        )
+                    except Exception as e:
+                        print(f"[DB ERROR] Error updating queue status: {e}")
                     self.skipped_count += 1
                     continue
 
-                # Check if URL was already indexed/skipped/processed
-                queue_status = self.queue_collection.find_one({"_id": current_url}, projection={"status": 1})
-                if queue_status and queue_status.get('status') != 'pending':
+                # Check if URL was already processed
+                try:
+                    queue_status = self.queue_collection.find_one(
+                        {"_id": current_url}, 
+                        projection={"status": 1}
+                    )
+                    if queue_status and queue_status.get('status') != 'pending':
+                        continue
+                except Exception as e:
+                    print(f"[DB ERROR] Error checking queue status: {e}")
                     continue
                     
-                # --- NEW: Robots.txt Check ---
+                # Robots.txt Check
                 if not self._is_url_allowed_by_robots(current_url):
-                    self.queue_collection.update_one({"_id": current_url}, {"$set": {"status": "disallowed_robots"}})
+                    try:
+                        self.queue_collection.update_one(
+                            {"_id": current_url}, 
+                            {"$set": {"status": "disallowed_robots"}}
+                        )
+                    except Exception as e:
+                        print(f"[DB ERROR] Error updating queue status: {e}")
                     self.skipped_count += 1
                     continue
-                # -----------------------------
 
                 # Fetch the page
                 html_content = self._fetch_page(current_url, current_depth)
@@ -600,7 +707,7 @@ class UnrestrictedWebSpider:
                     extracted_data = self._extract_data(html_content, current_url)
                     domain = self._get_domain(current_url)
                     
-                    # 1. Decide if we save the content (Saving is governed by _is_domain_allowed)
+                    # Decide if we save the content
                     if self._is_domain_allowed(current_url):
                         
                         # Domain Limit Check before indexing
@@ -608,8 +715,13 @@ class UnrestrictedWebSpider:
                         if self.max_pages_per_domain != UNLIMITED and current_domain_count >= self.max_pages_per_domain:
                             print(f"   -> Domain limit reached for {domain} ({current_domain_count}/{int(self.max_pages_per_domain)}). Skipping indexing.")
                             self.skipped_count += 1
-                            # Update status in DB
-                            self.queue_collection.update_one({"_id": current_url}, {"$set": {"status": "skipped"}})
+                            try:
+                                self.queue_collection.update_one(
+                                    {"_id": current_url}, 
+                                    {"$set": {"status": "skipped_domain_limit"}}
+                                )
+                            except Exception as e:
+                                print(f"[DB ERROR] Error updating queue status: {e}")
                         else:
                             # Index the page and update counts
                             document = {
@@ -628,22 +740,31 @@ class UnrestrictedWebSpider:
 
                             self.results_buffer.append(document)
                             self.indexed_count += 1
-                            self.domain_counts[domain] = current_domain_count + 1 # Increment domain count
+                            self.domain_counts[domain] = current_domain_count + 1
                             
-                            # Update status in DB to 'indexed'
-                            self.queue_collection.update_one({"_id": current_url}, {"$set": {"status": "indexed"}})
+                            try:
+                                self.queue_collection.update_one(
+                                    {"_id": current_url}, 
+                                    {"$set": {"status": "indexed"}}
+                                )
+                            except Exception as e:
+                                print(f"[DB ERROR] Error updating queue status: {e}")
 
                     else:
-                        # Page was crawled (because it was queued), but not saved (Toggle 2 behavior)
+                        # Page was crawled but not saved
                         self.skipped_count += 1
-                        # Update status in DB to 'processed_not_saved'
-                        self.queue_collection.update_one({"_id": current_url}, {"$set": {"status": "processed_not_saved"}})
+                        try:
+                            self.queue_collection.update_one(
+                                {"_id": current_url}, 
+                                {"$set": {"status": "processed_not_saved"}}
+                            )
+                        except Exception as e:
+                            print(f"[DB ERROR] Error updating queue status: {e}")
                         print(f"   -> Skipped saving content (External/Disallowed Domain): {current_url}")
-
 
                     self.batch_counter += 1
 
-                    # 2. Queue discovered links
+                    # Queue discovered links
                     next_depth = current_depth + 1
                     for link in extracted_data["links_found"]:
                         
@@ -657,91 +778,109 @@ class UnrestrictedWebSpider:
                             if self.domain_counts.get(link_domain, 0) >= self.max_pages_per_domain:
                                 continue
 
-                        # Queue the link
+                        # Queue the link (atomic operation)
                         self._add_to_queue_db(link, next_depth, parent_url=current_url)
 
                     # Synchronization and Rate Limiting Check
                     if self.batch_counter >= self.crawl_batch_size:
                         self._save_incremental_results_db()
-                        self._save_state_db() # Save metadata state
+                        self._save_state_db()
 
                         print(f"\n[COOLDOWN] Crawled {self.crawl_batch_size} pages. Resting for {self.cooldown_seconds} seconds...")
                         time.sleep(self.cooldown_seconds)
-                        print("[COOLDOWN] Resuming crawl.")
+                        print("[COOLDOWN] Resuming crawl.\n")
 
                         self.batch_counter = 0
                 
                 else:
-                    # If fetch failed, mark as skipped/failed in queue collection
-                    self.queue_collection.update_one({"_id": current_url}, {"$set": {"status": "skipped"}})
+                    # If fetch failed, mark as skipped/failed
+                    try:
+                        self.queue_collection.update_one(
+                            {"_id": current_url}, 
+                            {"$set": {"status": "failed_fetch"}}
+                        )
+                    except Exception as e:
+                        print(f"[DB ERROR] Error updating queue status: {e}")
                     self.skipped_count += 1
-
 
         except KeyboardInterrupt:
             print("\n!!! Crawl interrupted by user (Ctrl+C) !!!")
 
         except Exception as e:
             print(f"\n!!! Critical error encountered: {e} !!!")
+            import traceback
+            traceback.print_exc()
 
         finally:
             self._save_incremental_results_db()
             self._save_state_db()
             if self.client:
+                # Note: We keep the client connection open if possible, but close it here if the crawl loop ends naturally.
+                # In a threaded Flask environment, we might want to manage this differently, but for a simple worker, this is fine.
                 self.client.close()
             print(f"\nCrawling process halted.")
             print(f"Total indexed pages: {self.indexed_count}")
-            print(f"Total skipped pages (failed fetch or not saved): {self.skipped_count}")
+            print(f"Total skipped pages: {self.skipped_count}")
 
 
-# --- Execution Block ---
+# --- New Execution Block: Flask Wrapper ---
 
-if __name__ == "__main__":
+app = Flask(__name__)
 
-    # Read MONGO_URI from environment (required)
+def start_crawler_worker():
+    """Initializes and runs the UnrestrictedWebSpider in a persistent loop."""
+    
     MONGO_URI = os.getenv("MONGO_URI")
 
-    # All other configurations are pulled from the hardcoded defaults above
-    SEED_URLS = DEFAULT_CONFIG["SEED_URLS"]
-    MAX_PAGES = DEFAULT_CONFIG["MAX_PAGES"]
-    DEPTH_LIMIT = DEFAULT_CONFIG["DEPTH_LIMIT"]
-    MAX_PAGES_PER_DOMAIN = DEFAULT_CONFIG["MAX_PAGES_PER_DOMAIN"]
-    BATCH_SIZE = DEFAULT_CONFIG["BATCH_SIZE"]
-    COOLDOWN_TIME = DEFAULT_CONFIG["COOLDOWN_TIME"]
-    ALLOWED_DOMAINS = DEFAULT_CONFIG["ALLOWED_DOMAINS"]
-    BLACKLISTED_DOMAINS = DEFAULT_CONFIG["BLACKLISTED_DOMAINS"]
-    ENABLE_BREADCRUMBS = DEFAULT_CONFIG["ENABLE_BREADCRUMBS"]
-    RESUME_CRAWL = DEFAULT_CONFIG["RESUME_CRAWL"] # Now True
-    MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", DEFAULT_CONFIG["DB_NAME"])
-    
-    # --- TOGGLES ---
-    STRICT_DOMAIN_MODE = DEFAULT_CONFIG["STRICT_DOMAIN_MODE"]
-    CRAWL_EXTERNAL_BUT_DONT_SAVE = DEFAULT_CONFIG["CRAWL_EXTERNAL_BUT_DONT_SAVE"]
-    ROBOTS_ENABLED = DEFAULT_CONFIG["ROBOTS_ENABLED"] # Use default setting
-
-    if not SEED_URLS and not RESUME_CRAWL:
-        print("Warning: No initial SEED_URLS provided. Crawler will rely only on resumed state or user requests.")
-
     if not MONGO_URI:
-        print("Error: MONGO_URI environment variable is required to run the crawler.")
-    else:
-        try:
-            crawler = UnrestrictedWebSpider(
-                start_urls=SEED_URLS,
-                max_pages=MAX_PAGES,
-                depth_limit=DEPTH_LIMIT,
-                max_pages_per_domain=MAX_PAGES_PER_DOMAIN,
-                resume=RESUME_CRAWL,
-                crawl_batch_size=BATCH_SIZE,
-                cooldown_seconds=COOLDOWN_TIME,
-                allowed_domains=ALLOWED_DOMAINS,
-                blacklisted_domains=BLACKLISTED_DOMAINS,
-                save_breadcrumbs=ENABLE_BREADCRUMBS,
-                mongo_uri=MONGO_URI,
-                db_name=MONGO_DB_NAME,
-                strict_domain_mode=STRICT_DOMAIN_MODE,
-                crawl_external_but_dont_save=CRAWL_EXTERNAL_BUT_DONT_SAVE,
-                robots_enabled=ROBOTS_ENABLED 
-            )
-            crawler.crawl()
-        except Exception as e:
-            print(f"Crawler failed to initialize or run: {e}")
+        print("Error: MONGO_URI environment variable is required.")
+        return
+
+    try:
+        crawler = UnrestrictedWebSpider(
+            start_urls=DEFAULT_CONFIG["SEED_URLS"],
+            max_pages=DEFAULT_CONFIG["MAX_PAGES"],
+            depth_limit=DEFAULT_CONFIG["DEPTH_LIMIT"],
+            max_pages_per_domain=DEFAULT_CONFIG["MAX_PAGES_PER_DOMAIN"],
+            resume=DEFAULT_CONFIG["RESUME_CRAWL"],
+            crawl_batch_size=DEFAULT_CONFIG["BATCH_SIZE"],
+            cooldown_seconds=DEFAULT_CONFIG["COOLDOWN_TIME"],
+            allowed_domains=DEFAULT_CONFIG["ALLOWED_DOMAINS"],
+            blacklisted_domains=DEFAULT_CONFIG["BLACKLISTED_DOMAINS"],
+            save_breadcrumbs=DEFAULT_CONFIG["ENABLE_BREADCRUMBS"],
+            mongo_uri=MONGO_URI,
+            db_name=os.getenv("MONGO_DB_NAME", DEFAULT_CONFIG["DB_NAME"]),
+            strict_domain_mode=DEFAULT_CONFIG["STRICT_DOMAIN_MODE"],
+            crawl_external_but_dont_save=DEFAULT_CONFIG["CRAWL_EXTERNAL_BUT_DONT_SAVE"],
+            robots_enabled=DEFAULT_CONFIG["ROBOTS_ENABLED"],
+            max_queue_memory_size=DEFAULT_CONFIG["MAX_QUEUE_MEMORY_SIZE"]
+        )
+        crawler.crawl()
+    except Exception as e:
+        print(f"Crawler worker failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+@app.route('/')
+def home():
+    """Simple endpoint for Render health checks."""
+    return "Crawler Worker is running in the background.", 200
+
+# Start the crawler in a separate thread when the Flask app starts
+crawler_thread = threading.Thread(target=start_crawler_worker)
+crawler_thread.daemon = True # Allows the thread to exit when the main program exits
+
+if __name__ == "__main__":
+    
+    # Start the background worker thread
+    print("Starting background crawler thread...")
+    crawler_thread.start()
+    
+    # Determine the port required by the hosting environment (Render)
+    port = int(os.environ.get('PORT', 5000))
+    
+    print(f"Starting Flask web server on port {port} to keep the process alive.")
+    
+    # Run the Flask app, binding to the dynamic PORT environment variable
+    app.run(host='0.0.0.0', port=port)
