@@ -34,7 +34,7 @@ DEFAULT_CONFIG = {
     "DB_NAME": "greysearch_db",
     "STRICT_DOMAIN_MODE": False,
     "CRAWL_EXTERNAL_BUT_DONT_SAVE": True,
-    "ROBOTS_ENABLED": True,
+    "ROBOTS_ENABLED": False, #temporary
     "MAX_QUEUE_MEMORY_SIZE": 10000  # Limit in-memory queue size
 }
 # -----------------------------------------------------------------
@@ -915,3 +915,4 @@ if __name__ == "__main__":
             print(f"Crawler failed to initialize or run: {e}")
             import traceback
             traceback.print_exc()
+
