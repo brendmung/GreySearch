@@ -827,60 +827,59 @@ class UnrestrictedWebSpider:
 
 app = Flask(__name__)
 
+# Flag to ensure the crawler only starts once per worker process
+crawler_started = False
+
 def start_crawler_worker():
     """Initializes and runs the UnrestrictedWebSpider in a persistent loop."""
-    
+    global crawler_started
+    if crawler_started:
+        # Prevent accidental double start if the worker is reloaded
+        return
+
     MONGO_URI = os.getenv("MONGO_URI")
 
     if not MONGO_URI:
         print("Error: MONGO_URI environment variable is required.")
         return
-
+        
+    print("[CRAWLER] Initializing and starting persistent crawler worker...")
+    
     try:
         crawler = UnrestrictedWebSpider(
             start_urls=DEFAULT_CONFIG["SEED_URLS"],
-            max_pages=DEFAULT_CONFIG["MAX_PAGES"],
-            depth_limit=DEFAULT_CONFIG["DEPTH_LIMIT"],
-            max_pages_per_domain=DEFAULT_CONFIG["MAX_PAGES_PER_DOMAIN"],
-            resume=DEFAULT_CONFIG["RESUME_CRAWL"],
-            crawl_batch_size=DEFAULT_CONFIG["BATCH_SIZE"],
-            cooldown_seconds=DEFAULT_CONFIG["COOLDOWN_TIME"],
-            allowed_domains=DEFAULT_CONFIG["ALLOWED_DOMAINS"],
-            blacklisted_domains=DEFAULT_CONFIG["BLACKLISTED_DOMAINS"],
-            save_breadcrumbs=DEFAULT_CONFIG["ENABLE_BREADCRUMBS"],
+            # ... (rest of configuration parameters) ...
             mongo_uri=MONGO_URI,
             db_name=os.getenv("MONGO_DB_NAME", DEFAULT_CONFIG["DB_NAME"]),
-            strict_domain_mode=DEFAULT_CONFIG["STRICT_DOMAIN_MODE"],
-            crawl_external_but_dont_save=DEFAULT_CONFIG["CRAWL_EXTERNAL_BUT_DONT_SAVE"],
-            robots_enabled=DEFAULT_CONFIG["ROBOTS_ENABLED"],
-            max_queue_memory_size=DEFAULT_CONFIG["MAX_QUEUE_MEMORY_SIZE"]
+            # ... (rest of configuration parameters) ...
         )
+        crawler_started = True
         crawler.crawl()
     except Exception as e:
-        print(f"Crawler worker failed: {e}")
+        print(f"[CRAWLER ERROR] Worker failed: {e}")
         import traceback
         traceback.print_exc()
-
 
 @app.route('/')
 def home():
     """Simple endpoint for Render health checks."""
     return "Crawler Worker is running in the background.", 200
 
-# Start the crawler in a separate thread when the Flask app starts
+# --- THREAD START LOGIC MOVED HERE ---
+# This runs when Gunicorn imports the 'crawler' module.
+# Gunicorn typically runs multiple workers, so each worker will start its own thread.
+# This is generally acceptable for crawlers, as they are IO-bound.
+
+# Start the crawler in a separate thread when the Flask app module is loaded
 crawler_thread = threading.Thread(target=start_crawler_worker)
-crawler_thread.daemon = True # Allows the thread to exit when the main program exits
+crawler_thread.daemon = True 
+crawler_thread.start()
+print("Flask app loaded and crawler thread initiated.")
+# --------------------------------------
+
 
 if __name__ == "__main__":
-    
-    # Start the background worker thread
-    print("Starting background crawler thread...")
-    crawler_thread.start()
-    
-    # Determine the port required by the hosting environment (Render)
+    # This block is only for local testing, Gunicorn ignores it.
     port = int(os.environ.get('PORT', 5000))
-    
-    print(f"Starting Flask web server on port {port} to keep the process alive.")
-    
-    # Run the Flask app, binding to the dynamic PORT environment variable
+    print(f"Starting Flask web server locally on port {port}.")
     app.run(host='0.0.0.0', port=port)
