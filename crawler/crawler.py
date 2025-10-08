@@ -21,7 +21,7 @@ UNLIMITED = float('inf')
 
 # --- Hardcoded Configuration Defaults ---
 DEFAULT_CONFIG = {
-    "SEED_URLS": ["https://en.wikipedia.org/wiki/Main_Page", "https://github.com"],
+    "SEED_URLS": ["https://keid-lists.pages.dev"],
     "MAX_PAGES": UNLIMITED,
     "DEPTH_LIMIT": 2, 
     "MAX_PAGES_PER_DOMAIN": 300, 
@@ -915,4 +915,5 @@ if __name__ == "__main__":
             print(f"Crawler failed to initialize or run: {e}")
             import traceback
             traceback.print_exc()
+
 
